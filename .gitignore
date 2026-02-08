@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# beads (br) local database (JSONL export is tracked)
+.beads/*.db
+.beads/*.db-shm
+.beads/*.db-wal
+.beads/*.lock
+.beads/last-touched
