@@ -15,7 +15,7 @@ use casr::pipeline::{ConversionPipeline, ConvertOptions};
 
 /// Cross Agent Session Resumer — resume AI coding sessions across providers.
 ///
-/// Convert sessions between Claude Code, Codex, and Gemini CLI so you can
+/// Convert sessions between Claude Code, Codex, Gemini CLI, and Cursor so you can
 /// pick up where you left off with a different agent.
 #[derive(Parser, Debug)]
 #[command(
@@ -45,7 +45,7 @@ struct Cli {
 enum Command {
     /// Convert and resume a session from another provider.
     Resume {
-        /// Target provider alias (cc, cod, gmi).
+        /// Target provider alias (cc, cod, gmi, cur).
         target: String,
         /// Session ID to convert.
         session_id: String,
@@ -326,7 +326,7 @@ fn cmd_list(provider_filter: Option<&str>, limit: usize, json_mode: bool) -> any
                 }
                 let path = entry.path();
                 let ext = path.extension().and_then(|e| e.to_str());
-                if !matches!(ext, Some("jsonl") | Some("json")) {
+                if !matches!(ext, Some("jsonl") | Some("json") | Some("vscdb")) {
                     continue;
                 }
 

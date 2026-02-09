@@ -307,6 +307,20 @@ impl ConversionPipeline {
             session_id, "starting conversion"
         );
 
+        let target_detection = target_provider.detect();
+        let mut all_warnings: Vec<String> = Vec::new();
+        if !target_detection.installed {
+            warn!(
+                target = target_provider.name(),
+                "target provider CLI not detected; conversion will continue with filesystem-only checks"
+            );
+            all_warnings.push(format!(
+                "Target provider '{}' is not detected as installed. Conversion can still write files, \
+but resume may fail until the CLI is installed.",
+                target_provider.name()
+            ));
+        }
+
         // 2. Resolve source session.
         let source_hint = opts.source_hint.as_deref().map(SourceHint::parse);
         let resolved = self
@@ -329,7 +343,7 @@ impl ConversionPipeline {
 
         // 4. Validate.
         let validation = validate_session(&canonical);
-        let mut all_warnings: Vec<String> = validation.warnings.clone();
+        all_warnings.extend(validation.warnings.clone());
 
         if validation.has_errors() {
             return Err(CasrError::ValidationError {
@@ -371,6 +385,26 @@ impl ConversionPipeline {
             });
         }
 
+        // 6. Same-provider short-circuit.
+        if !opts.enrich && resolved.provider.slug() == target_provider.slug() {
+            info!("source and target provider are the same — skipping write and verify");
+            all_warnings.push(
+                "Source and target provider are the same. Skipping conversion write.".to_string(),
+            );
+            return Ok(ConversionResult {
+                source_provider: resolved.provider.slug().to_string(),
+                target_provider: target_provider.slug().to_string(),
+                canonical_session: canonical.clone(),
+                written: Some(WrittenSession {
+                    paths: Vec::new(),
+                    session_id: canonical.session_id.clone(),
+                    resume_command: target_provider.resume_command(&canonical.session_id),
+                    backup_path: None,
+                }),
+                warnings: all_warnings,
+            });
+        }
+
         // 6. Write to target provider.
         let write_opts = WriteOptions { force: opts.force };
         let written = target_provider.write_session(&canonical, &write_opts)?;
@@ -390,18 +424,42 @@ impl ConversionPipeline {
                         "read-back verification"
                     );
                     if readback.messages.len() != canonical.messages.len() {
-                        all_warnings.push(format!(
-                            "Read-back message count mismatch: wrote {} messages, read back {}.",
+                        let detail = format!(
+                            "message count mismatch: wrote {} messages, read back {}",
                             canonical.messages.len(),
                             readback.messages.len()
-                        ));
+                        );
+                        warn!(detail, "read-back verification failed");
+                        let rollback_detail =
+                            match rollback_written_session(target_provider.slug(), &written) {
+                                Ok(()) => "rollback succeeded".to_string(),
+                                Err(rollback_error) => {
+                                    format!("rollback failed: {rollback_error}")
+                                }
+                            };
+                        return Err(CasrError::VerifyFailed {
+                            provider: target_provider.slug().to_string(),
+                            written_paths: written.paths.clone(),
+                            detail: format!("{detail}; {rollback_detail}"),
+                        }
+                        .into());
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "read-back verification failed");
-                    // Restore backup if possible.
-                    // For now, add a warning rather than failing hard.
-                    all_warnings.push(format!("Read-back verification failed: {e}"));
+                    let rollback_detail =
+                        match rollback_written_session(target_provider.slug(), &written) {
+                            Ok(()) => "rollback succeeded".to_string(),
+                            Err(rollback_error) => {
+                                format!("rollback failed: {rollback_error}")
+                            }
+                        };
+                    return Err(CasrError::VerifyFailed {
+                        provider: target_provider.slug().to_string(),
+                        written_paths: written.paths.clone(),
+                        detail: format!("unable to read written session: {e}; {rollback_detail}"),
+                    }
+                    .into());
                 }
             }
         }
@@ -414,6 +472,70 @@ impl ConversionPipeline {
             warnings: all_warnings,
         })
     }
+}
+
+fn rollback_written_session(
+    provider_slug: &str,
+    written: &WrittenSession,
+) -> Result<(), CasrError> {
+    let target_path = written.paths.first().cloned();
+    if let Some(path) = &target_path
+        && let Some(backup_path) = &written.backup_path
+    {
+        warn!(
+            backup = %backup_path.display(),
+            target = %path.display(),
+            "restoring backup after verification failure"
+        );
+
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CasrError::SessionWriteError {
+                    path: path.clone(),
+                    provider: provider_slug.to_string(),
+                    detail: format!("failed to remove unverified output before restore: {error}"),
+                });
+            }
+        }
+
+        std::fs::rename(backup_path, path).map_err(|error| CasrError::SessionWriteError {
+            path: path.clone(),
+            provider: provider_slug.to_string(),
+            detail: format!("failed to restore backup: {error}"),
+        })?;
+    }
+
+    for (index, path) in written.paths.iter().enumerate() {
+        if index == 0 && written.backup_path.is_some() {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CasrError::SessionWriteError {
+                    path: path.clone(),
+                    provider: provider_slug.to_string(),
+                    detail: format!("failed to remove unverified output: {error}"),
+                });
+            }
+        }
+    }
+
+    if target_path.is_none() && written.backup_path.is_some() {
+        return Err(CasrError::SessionWriteError {
+            path: written
+                .backup_path
+                .clone()
+                .expect("checked backup_path is_some"),
+            provider: provider_slug.to_string(),
+            detail: "backup path present but no written target path was recorded".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +551,40 @@ pub struct AtomicWriteOutcome {
     pub temp_path: PathBuf,
     /// Path to the `.bak` backup of a pre-existing file (if `--force` was used).
     pub backup_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteFailStage {
+    BackupRename,
+    TempFileCreate,
+    WriteAll,
+    Flush,
+    SyncAll,
+    FinalRename,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_WRITE_FAIL_STAGE: std::cell::Cell<Option<AtomicWriteFailStage>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn set_atomic_write_fail_stage(stage: Option<AtomicWriteFailStage>) {
+    ATOMIC_WRITE_FAIL_STAGE.with(|slot| slot.set(stage));
+}
+
+#[cfg(test)]
+fn maybe_inject_atomic_write_failure(stage: AtomicWriteFailStage) -> std::io::Result<()> {
+    let injected = ATOMIC_WRITE_FAIL_STAGE.with(|slot| slot.get() == Some(stage));
+    if injected {
+        return Err(std::io::Error::other(format!(
+            "injected atomic_write failure at stage {stage:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Write `content` atomically to `target_path` using temp-then-rename.
@@ -470,6 +626,14 @@ pub fn atomic_write(
             backup = %bak.display(),
             "backing up existing file"
         );
+        #[cfg(test)]
+        maybe_inject_atomic_write_failure(AtomicWriteFailStage::BackupRename).map_err(|e| {
+            CasrError::SessionWriteError {
+                path: target_path.to_path_buf(),
+                provider: String::new(),
+                detail: format!("failed to create backup: {e}"),
+            }
+        })?;
         std::fs::rename(target_path, &bak).map_err(|e| CasrError::SessionWriteError {
             path: target_path.to_path_buf(),
             provider: String::new(),
@@ -488,9 +652,17 @@ pub fn atomic_write(
         .join(&temp_name);
 
     let write_result = (|| -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        maybe_inject_atomic_write_failure(AtomicWriteFailStage::TempFileCreate)?;
         let mut file = std::fs::File::create(&temp_path)?;
+        #[cfg(test)]
+        maybe_inject_atomic_write_failure(AtomicWriteFailStage::WriteAll)?;
         file.write_all(content)?;
+        #[cfg(test)]
+        maybe_inject_atomic_write_failure(AtomicWriteFailStage::Flush)?;
         file.flush()?;
+        #[cfg(test)]
+        maybe_inject_atomic_write_failure(AtomicWriteFailStage::SyncAll)?;
         file.sync_all()?;
         Ok(())
     })();
@@ -515,6 +687,24 @@ pub fn atomic_write(
     }
 
     // 4. Atomic rename temp -> target.
+    #[cfg(test)]
+    if let Err(e) = maybe_inject_atomic_write_failure(AtomicWriteFailStage::FinalRename) {
+        let _ = std::fs::remove_file(&temp_path);
+        if let Some(ref bak) = backup_path {
+            warn!(
+                backup = %bak.display(),
+                target = %target_path.display(),
+                "restoring backup after rename failure"
+            );
+            let _ = std::fs::rename(bak, target_path);
+        }
+        return Err(CasrError::SessionWriteError {
+            path: target_path.to_path_buf(),
+            provider: String::new(),
+            detail: format!("failed to rename temp file to target: {e}"),
+        });
+    }
+
     if let Err(e) = std::fs::rename(&temp_path, target_path) {
         let _ = std::fs::remove_file(&temp_path);
         if let Some(ref bak) = backup_path {
@@ -587,7 +777,10 @@ fn find_backup_path(target: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     fn sample_message(idx: usize, role: MessageRole, content: &str) -> CanonicalMessage {
         CanonicalMessage {
@@ -688,5 +881,175 @@ mod tests {
         assert!(summary.contains("- user: Please also verify resume command"));
         assert!(summary.contains("- assistant: This has extra spacing"));
         assert!(summary.contains("..."));
+    }
+
+    struct FailStageReset;
+
+    impl Drop for FailStageReset {
+        fn drop(&mut self) {
+            set_atomic_write_fail_stage(None);
+        }
+    }
+
+    fn with_fail_stage(stage: AtomicWriteFailStage) -> FailStageReset {
+        set_atomic_write_fail_stage(Some(stage));
+        FailStageReset
+    }
+
+    fn count_temp_artifacts(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".casr-tmp-")
+            })
+            .count()
+    }
+
+    fn backup_artifacts_for(target: &Path) -> Vec<PathBuf> {
+        let parent = target.parent().expect("target parent");
+        let prefix = format!(
+            "{}.bak",
+            target
+                .file_name()
+                .expect("target file name")
+                .to_string_lossy()
+        );
+        fs::read_dir(parent)
+            .expect("read parent")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn atomic_write_conflict_without_force_returns_session_conflict() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("session.jsonl");
+        fs::write(&target, "existing").expect("seed target");
+
+        let err = atomic_write(&target, b"new content", false).expect_err("should conflict");
+        assert!(matches!(err, CasrError::SessionConflict { .. }));
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should remain"),
+            "existing"
+        );
+    }
+
+    #[test]
+    fn atomic_write_failure_matrix_restores_backup_and_cleans_temp_files() {
+        for stage in [
+            AtomicWriteFailStage::TempFileCreate,
+            AtomicWriteFailStage::WriteAll,
+            AtomicWriteFailStage::Flush,
+            AtomicWriteFailStage::SyncAll,
+            AtomicWriteFailStage::FinalRename,
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let target = tmp.path().join("session.jsonl");
+            fs::write(&target, "original").expect("seed target");
+
+            let _reset = with_fail_stage(stage);
+            let err = atomic_write(&target, b"new content", true).expect_err("expected failure");
+            assert!(
+                matches!(err, CasrError::SessionWriteError { .. }),
+                "expected SessionWriteError for stage {stage:?}, got {err:?}"
+            );
+
+            assert_eq!(
+                fs::read_to_string(&target).expect("target should be restored"),
+                "original",
+                "original content should be restored for stage {stage:?}"
+            );
+            assert_eq!(
+                count_temp_artifacts(tmp.path()),
+                0,
+                "no temp artifacts should remain for stage {stage:?}"
+            );
+            assert!(
+                backup_artifacts_for(&target).is_empty(),
+                "backup artifacts should not remain for stage {stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_write_backup_creation_failure_preserves_original_target() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("session.jsonl");
+        fs::write(&target, "original").expect("seed target");
+
+        let _reset = with_fail_stage(AtomicWriteFailStage::BackupRename);
+        let err = atomic_write(&target, b"new content", true).expect_err("expected failure");
+        let CasrError::SessionWriteError { detail, .. } = err else {
+            panic!("expected SessionWriteError, got {err:?}");
+        };
+        assert!(
+            detail.contains("failed to create backup"),
+            "unexpected detail: {detail}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should remain"),
+            "original"
+        );
+        assert_eq!(count_temp_artifacts(tmp.path()), 0);
+        assert!(backup_artifacts_for(&target).is_empty());
+    }
+
+    #[test]
+    fn atomic_write_success_force_creates_backup_and_restore_backup_recovers_original() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("session.jsonl");
+        fs::write(&target, "original").expect("seed target");
+
+        let outcome =
+            atomic_write(&target, b"new content", true).expect("force write should succeed");
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should contain new content"),
+            "new content"
+        );
+        assert!(
+            !outcome.temp_path.exists(),
+            "temp file should be renamed away"
+        );
+
+        let backup = outcome.backup_path.as_ref().expect("backup should exist");
+        assert_eq!(
+            fs::read_to_string(backup).expect("backup should contain original"),
+            "original"
+        );
+
+        restore_backup(&outcome).expect("restore should succeed");
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should be restored"),
+            "original"
+        );
+        assert!(!backup.exists(), "backup should be consumed during restore");
+    }
+
+    #[test]
+    fn restore_backup_without_backup_removes_target() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("session.jsonl");
+
+        let outcome =
+            atomic_write(&target, b"fresh content", false).expect("initial write should succeed");
+        assert!(target.exists(), "target should exist after write");
+        assert!(outcome.backup_path.is_none(), "no backup expected");
+
+        restore_backup(&outcome).expect("restore should succeed without backup");
+        assert!(
+            !target.exists(),
+            "target should be removed when no backup is available"
+        );
     }
 }
