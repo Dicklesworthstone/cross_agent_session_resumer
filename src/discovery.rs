@@ -99,6 +99,7 @@ impl ProviderRegistry {
             Box::new(crate::providers::claude_code::ClaudeCode),
             Box::new(crate::providers::codex::Codex),
             Box::new(crate::providers::gemini::Gemini),
+            Box::new(crate::providers::cursor::Cursor),
         ])
     }
 
