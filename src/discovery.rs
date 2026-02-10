@@ -106,6 +106,7 @@ impl ProviderRegistry {
             Box::new(crate::providers::amp::Amp),
             Box::new(crate::providers::opencode::OpenCode),
             Box::new(crate::providers::chatgpt::ChatGpt),
+            Box::new(crate::providers::clawdbot::ClawdBot),
         ])
     }
 
@@ -455,6 +456,13 @@ impl ProviderRegistry {
                         && value.get("cwd").is_some()
                     {
                         return self.find_by_slug("claude-code");
+                    }
+                    // ClawdBot: bare JSONL messages with role+content, no type field.
+                    if value.get("role").is_some()
+                        && value.get("content").is_some()
+                        && value.get("type").is_none()
+                    {
+                        return self.find_by_slug("clawdbot");
                     }
                     break;
                 }
