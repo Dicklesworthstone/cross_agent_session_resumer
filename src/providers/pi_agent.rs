@@ -375,6 +375,8 @@ impl Provider for PiAgent {
         session: &CanonicalSession,
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
+        // Pi-Agent filenames must contain an underscore to be discoverable
+        // by `owns_session`. Convention: `<timestamp>_<uuid>.jsonl`.
         let session_id = if session.session_id.is_empty() {
             let now = chrono::Utc::now();
             format!(
@@ -382,8 +384,12 @@ impl Provider for PiAgent {
                 now.format("%Y-%m-%dT%H-%M-%S"),
                 uuid::Uuid::new_v4()
             )
-        } else {
+        } else if session.session_id.contains('_') {
             session.session_id.clone()
+        } else {
+            // Incoming ID lacks underscore — prefix with timestamp.
+            let now = chrono::Utc::now();
+            format!("{}_{}", now.format("%Y-%m-%dT%H-%M-%S"), session.session_id)
         };
 
         let home = Self::home_dir();
@@ -413,7 +419,9 @@ impl Provider for PiAgent {
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
             "cwd": workspace,
-            "provider": session.model_name.as_deref().unwrap_or("unknown"),
+            "provider": session.metadata.get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or(session.provider_slug.as_str()),
             "modelId": session.model_name.as_deref().unwrap_or("unknown"),
         });
         lines.push(serde_json::to_string(&header)?);

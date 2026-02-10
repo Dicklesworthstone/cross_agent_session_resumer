@@ -142,8 +142,10 @@ impl Provider for OpenClaw {
             false
         };
         let installed = installed || parent_exists;
-        let evidence = if installed {
+        let evidence = if root.is_dir() {
             vec![format!("sessions directory found: {}", root.display())]
+        } else if parent_exists {
+            vec![format!("parent directory found (sessions dir not yet created): {}", root.display())]
         } else {
             vec![]
         };
