@@ -4,6 +4,7 @@
 # This script intentionally uses real provider homes and CLIs. It is NOT run in CI.
 # It performs conversion + resume acceptance probes for:
 #   CC <-> Codex, CC <-> Gemini, Codex <-> Gemini
+#   CC <-> Cursor, CC <-> Cline, CC <-> Aider, CC <-> Amp, CC <-> OpenCode
 #
 # Artifacts:
 #   - run.log: command transcript
@@ -20,6 +21,11 @@
 #   SMOKE_ACCEPT_CMD_CC='claude --resume {session_id}' bash scripts/real_provider_smoke.sh
 #   SMOKE_ACCEPT_CMD_COD='codex resume {session_id}' bash scripts/real_provider_smoke.sh
 #   SMOKE_ACCEPT_CMD_GMI='gemini --resume {session_id}' bash scripts/real_provider_smoke.sh
+#   SMOKE_ACCEPT_CMD_CUR='cursor .' bash scripts/real_provider_smoke.sh
+#   SMOKE_ACCEPT_CMD_CLN='code .' bash scripts/real_provider_smoke.sh
+#   SMOKE_ACCEPT_CMD_AID='aider --restore-chat-history' bash scripts/real_provider_smoke.sh
+#   SMOKE_ACCEPT_CMD_AMP='amp threads continue --execute \"Continue from @{session_id}\"' bash scripts/real_provider_smoke.sh
+#   SMOKE_ACCEPT_CMD_OPC='opencode' bash scripts/real_provider_smoke.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,25 +61,47 @@ declare -A PROVIDER_SLUG=(
     [cc]="claude-code"
     [cod]="codex"
     [gmi]="gemini"
+    [cur]="cursor"
+    [cln]="cline"
+    [aid]="aider"
+    [amp]="amp"
+    [opc]="opencode"
 )
 
 declare -A PROVIDER_BIN=(
     [cc]="claude"
     [cod]="codex"
     [gmi]="gemini"
+    [cur]="cursor"
+    [cln]="code"
+    [aid]="aider"
+    [amp]="amp"
+    [opc]="opencode"
 )
 
 declare -A PROVIDER_HOME=(
     [cc]="${CLAUDE_HOME:-$HOME/.claude}"
     [cod]="${CODEX_HOME:-$HOME/.codex}"
     [gmi]="${GEMINI_HOME:-$HOME/.gemini}"
+    [cur]="${CURSOR_HOME:-$HOME/.config/Cursor}"
+    [cln]="${CLINE_HOME:-$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev}"
+    [aid]="${AIDER_HOME:-$HOME/.aider}"
+    [amp]="${AMP_HOME:-$HOME/.local/share/amp}"
+    [opc]="${OPENCODE_HOME:-$HOME/.opencode}"
 )
 
 declare -A ACCEPT_TEMPLATE=(
     [cc]="${SMOKE_ACCEPT_CMD_CC:-}"
     [cod]="${SMOKE_ACCEPT_CMD_COD:-}"
     [gmi]="${SMOKE_ACCEPT_CMD_GMI:-}"
+    [cur]="${SMOKE_ACCEPT_CMD_CUR:-}"
+    [cln]="${SMOKE_ACCEPT_CMD_CLN:-}"
+    [aid]="${SMOKE_ACCEPT_CMD_AID:-}"
+    [amp]="${SMOKE_ACCEPT_CMD_AMP:-}"
+    [opc]="${SMOKE_ACCEPT_CMD_OPC:-}"
 )
+
+ALL_ALIASES=(cc cod gmi cur cln aid amp opc)
 
 declare -A SOURCE_SESSION_ID=()
 declare -A PROVIDER_READY=()
