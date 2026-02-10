@@ -109,6 +109,8 @@ impl ProviderRegistry {
             Box::new(crate::providers::clawdbot::ClawdBot),
             Box::new(crate::providers::vibe::Vibe),
             Box::new(crate::providers::factory::Factory),
+            Box::new(crate::providers::openclaw::OpenClaw),
+            Box::new(crate::providers::pi_agent::PiAgent),
         ])
     }
 
@@ -456,6 +458,29 @@ impl ProviderRegistry {
                     // Factory: JSONL with session_start typed entry.
                     if value.get("type").and_then(|v| v.as_str()) == Some("session_start") {
                         return self.find_by_slug("factory");
+                    }
+                    // OpenClaw: type:"session" with version field.
+                    if value.get("type").and_then(|v| v.as_str()) == Some("session")
+                        && value.get("version").is_some()
+                    {
+                        return self.find_by_slug("openclaw");
+                    }
+                    // Pi-Agent: type:"session" with provider/modelId fields.
+                    if value.get("type").and_then(|v| v.as_str()) == Some("session")
+                        && (value.get("provider").is_some() || value.get("modelId").is_some())
+                    {
+                        return self.find_by_slug("pi-agent");
+                    }
+                    // OpenClaw/Pi-Agent: type:"message" with nested "message" object.
+                    if value.get("type").and_then(|v| v.as_str()) == Some("message")
+                        && value.get("message").is_some()
+                    {
+                        // Disambiguate by filename pattern: Pi-Agent uses underscore.
+                        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        if stem.contains('_') {
+                            return self.find_by_slug("pi-agent");
+                        }
+                        return self.find_by_slug("openclaw");
                     }
                     if value.get("sessionId").is_some()
                         && value.get("uuid").is_some()

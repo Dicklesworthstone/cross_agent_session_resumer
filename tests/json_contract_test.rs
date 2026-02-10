@@ -36,6 +36,8 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("CLAWDBOT_HOME", tmp.path().join("clawdbot"))
         .env("VIBE_HOME", tmp.path().join("vibe"))
         .env("FACTORY_HOME", tmp.path().join("factory"))
+        .env("OPENCLAW_HOME", tmp.path().join("openclaw"))
+        .env("PI_AGENT_HOME", tmp.path().join("pi-agent"))
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
         .env("XDG_DATA_HOME", tmp.path().join("xdg-data"))
         .env("NO_COLOR", "1");
@@ -241,8 +243,8 @@ fn contract_providers_json_shape() {
         .expect("providers --json should be an array");
     assert_eq!(
         arr.len(),
-        12,
-        "should list 12 providers (CC, Codex, Gemini, Cursor, Cline, Aider, Amp, OpenCode, ChatGPT, ClawdBot, Vibe, Factory)"
+        14,
+        "should list 14 providers (CC, Codex, Gemini, Cursor, Cline, Aider, Amp, OpenCode, ChatGPT, ClawdBot, Vibe, Factory, OpenClaw, Pi-Agent)"
     );
 
     for (i, item) in arr.iter().enumerate() {
@@ -278,6 +280,8 @@ fn contract_providers_known_slugs() {
     assert!(slugs.contains(&"clawdbot"), "should contain clawdbot");
     assert!(slugs.contains(&"vibe"), "should contain vibe");
     assert!(slugs.contains(&"factory"), "should contain factory");
+    assert!(slugs.contains(&"openclaw"), "should contain openclaw");
+    assert!(slugs.contains(&"pi-agent"), "should contain pi-agent");
 }
 
 #[test]
@@ -312,6 +316,8 @@ fn contract_providers_aliases_match_slugs() {
             "clawdbot" => assert_eq!(*alias, "cwb"),
             "vibe" => assert_eq!(*alias, "vib"),
             "factory" => assert_eq!(*alias, "fac"),
+            "openclaw" => assert_eq!(*alias, "ocl"),
+            "pi-agent" => assert_eq!(*alias, "pi"),
             other => panic!("Unexpected slug: {other}"),
         }
     }
@@ -940,6 +946,8 @@ fn contract_list_provider_field_matches_slug() {
         "clawdbot",
         "vibe",
         "factory",
+        "openclaw",
+        "pi-agent",
     ];
     for item in parsed.as_array().unwrap() {
         let provider = item["provider"].as_str().unwrap();
