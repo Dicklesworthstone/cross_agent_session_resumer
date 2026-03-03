@@ -109,6 +109,45 @@ impl Provider for Codex {
         }
     }
 
+    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+        let sessions_dir = Self::sessions_dir()?;
+        if !sessions_dir.is_dir() {
+            return Some(vec![]);
+        }
+
+        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+        for entry in WalkDir::new(&sessions_dir)
+            .max_depth(5)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("rollout-")
+                && (name.ends_with(".jsonl") || name.ends_with(".json")))
+            {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+
+            // Prefer authoritative ID from session_meta payload; otherwise
+            // retain filename stem for best-effort diagnostics.
+            let session_id = session_meta_id(path).unwrap_or_else(|| stem.to_string());
+            sessions.push((session_id, path.to_path_buf()));
+        }
+
+        Some(sessions)
+    }
+
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         let sessions_dir = Self::sessions_dir()?;
         if !sessions_dir.is_dir() {
@@ -507,7 +546,7 @@ impl Codex {
                         let role = normalize_role(role_str);
 
                         let content_val = p.get("content");
-                        let text = content_val.map(flatten_content).unwrap_or_default();
+                        let text = codex_extract_text_content(content_val);
                         let tool_calls = codex_extract_tool_calls(content_val);
                         let tool_results = codex_extract_tool_results(content_val);
 
@@ -719,6 +758,47 @@ impl Codex {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract only plain assistant/user text from Codex content blocks.
+///
+/// We intentionally ignore `tool_use` and `tool_result` blocks here because
+/// those are parsed into structured `tool_calls` / `tool_results` separately.
+/// Including tool blocks in flattened text causes read-back content inflation
+/// and spurious verification mismatches.
+fn codex_extract_text_content(content: Option<&serde_json::Value>) -> String {
+    let Some(value) = content else {
+        return String::new();
+    };
+
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let mut parts: Vec<String> = Vec::new();
+            for block in blocks {
+                match block {
+                    serde_json::Value::String(s) => parts.push(s.clone()),
+                    serde_json::Value::Object(obj) => {
+                        let block_type = obj.get("type").and_then(|v| v.as_str());
+                        if (matches!(block_type, Some("text") | Some("input_text"))
+                            || block_type.is_none())
+                            && let Some(text) = obj.get("text").and_then(|v| v.as_str())
+                        {
+                            parts.push(text.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parts.join("\n")
+        }
+        serde_json::Value::Object(obj) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
 
 /// Extract tool calls from Codex content blocks.
 fn codex_extract_tool_calls(content: Option<&serde_json::Value>) -> Vec<ToolCall> {
@@ -981,6 +1061,7 @@ mod tests {
 {"type":"event_msg","timestamp":1700000001.0,"payload":{"type":"user_message","message":"Run it"}}
 {"type":"response_item","timestamp":1700000002.0,"payload":{"role":"assistant","content":[{"type":"input_text","text":"Running"},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}"#,
         );
+        assert_eq!(session.messages[1].content, "Running");
         assert_eq!(session.messages[1].tool_calls.len(), 1);
         assert_eq!(session.messages[1].tool_calls[0].name, "Bash");
     }

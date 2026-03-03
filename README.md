@@ -40,6 +40,11 @@ casr info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 # 4) Convert that session to Claude Code format
 casr cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
+# ergonomic shorthand (auto-detects source provider from the session ID)
+casr -cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # open in Claude Code
+casr -cod 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Codex
+casr -gmi 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Gemini CLI
+
 # 5) Resume in Claude Code using the generated ID
 claude --resume <new-session-id>
 ```
@@ -192,6 +197,9 @@ casr list
 casr list --provider codex
 casr list --workspace /data/projects/myapp
 casr list --limit 100 --sort messages
+
+# default behavior (no args): current workspace only, top 10, styled table output
+casr list
 ```
 
 ### `casr info <session-id>`

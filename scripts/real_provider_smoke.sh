@@ -30,10 +30,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CARGO_TARGET="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
-CASR="${CASR_BIN:-$CARGO_TARGET/debug/casr}"
+# Always default to the project-local debug binary so smoke runs match the
+# current source tree even when CARGO_TARGET_DIR points elsewhere.
+CASR="${CASR_BIN:-$PROJECT_ROOT/target/debug/casr}"
 VERBOSE="${VERBOSE:-0}"
 SMOKE_ACCEPT_TIMEOUT="${SMOKE_ACCEPT_TIMEOUT:-8}"
+SMOKE_WORKSPACE="${SMOKE_WORKSPACE:-/data/projects}"
+SMOKE_REBUILD="${SMOKE_REBUILD:-1}"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 ARTIFACTS_DIR="${SMOKE_ARTIFACTS_DIR:-$PROJECT_ROOT/artifacts/real-smoke/$timestamp}"
@@ -205,9 +208,13 @@ ensure_prereqs() {
         echo "ERROR: timeout is required."
         exit 1
     fi
-    if [[ ! -x "$CASR" ]]; then
+    if [[ "$SMOKE_REBUILD" == "1" || ! -x "$CASR" ]]; then
         banner "Building casr"
-        (cd "$PROJECT_ROOT" && cargo build --quiet)
+        if command -v rch > /dev/null 2>&1; then
+            (cd "$PROJECT_ROOT" && rch exec -- cargo build --quiet)
+        else
+            (cd "$PROJECT_ROOT" && cargo build --quiet)
+        fi
     fi
     if [[ ! -x "$CASR" ]]; then
         echo "ERROR: casr binary not found at $CASR"
@@ -219,8 +226,52 @@ source_session_for_alias() {
     local alias="$1"
     local slug="${PROVIDER_SLUG[$alias]}"
     local prefix="$ARTIFACTS_DIR/list_${alias}"
+    local candidate_file=""
+    local candidate_id=""
+    local uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
-    run_cmd "$prefix" "$CASR" --json list --provider "$slug" --limit 25
+    case "$alias" in
+        cc)
+            candidate_file="$(find "${PROVIDER_HOME[$alias]}/projects" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -d' ' -f2- || true)"
+            if [[ -n "$candidate_file" ]]; then
+                # Prefer authoritative sessionId from file body.
+                candidate_id="$(jq -r '.sessionId // empty' "$candidate_file" 2>/dev/null | head -n 1)"
+                if [[ -z "$candidate_id" ]]; then
+                    candidate_id="$(basename "$candidate_file" .jsonl)"
+                fi
+                # Ignore non-session UUID-like filenames (e.g. compact artifacts).
+                if [[ ! "$candidate_id" =~ $uuid_re ]]; then
+                    candidate_id=""
+                fi
+            fi
+            ;;
+        cod)
+            candidate_file="$(find "${PROVIDER_HOME[$alias]}/sessions" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -d' ' -f2- || true)"
+            if [[ -n "$candidate_file" ]]; then
+                candidate_id="$(jq -r 'select(.type=="session_meta") | .payload.id // empty' "$candidate_file" 2>/dev/null | head -n 1)"
+            fi
+            ;;
+        gmi)
+            candidate_file="$(find "${PROVIDER_HOME[$alias]}/tmp" -type f -name 'session-*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -d' ' -f2- || true)"
+            if [[ -n "$candidate_file" ]]; then
+                # Prefer full sessionId from file body over filename timestamp prefix.
+                candidate_id="$(jq -r '.sessionId // empty' "$candidate_file" 2>/dev/null | head -n 1)"
+                if [[ -z "$candidate_id" ]]; then
+                    candidate_id="$(basename "$candidate_file" .json)"
+                    candidate_id="${candidate_id#session-}"
+                fi
+            fi
+            ;;
+    esac
+
+    if [[ -n "$candidate_id" ]]; then
+        log "Resolved source session for $alias via fast path: $candidate_id ($candidate_file)"
+        echo "$candidate_id"
+        return 0
+    fi
+
+    # Fallback: ask casr directly, but bound runtime to avoid full-home scans hanging forever.
+    run_cmd "$prefix" timeout 25s "$CASR" --json list --provider "$slug" --workspace "$SMOKE_WORKSPACE" --limit 25
     if [[ "$LAST_EXIT" -ne 0 ]]; then
         echo ""
         return 0
@@ -267,6 +318,13 @@ expand_accept_command() {
     local resume_command="$3"
     local template="${ACCEPT_TEMPLATE[$alias]}"
     if [[ -z "$template" ]]; then
+        # Codex CLI requires a TTY; wrap with `script` when available so
+        # acceptance probes exercise real resume behavior instead of failing
+        # with "stdin is not a terminal".
+        if [[ "$alias" == "cod" ]] && command -v script > /dev/null 2>&1; then
+            echo "script -q -c 'codex resume $target_session' /dev/null"
+            return 0
+        fi
         echo "$resume_command"
         return 0
     fi

@@ -27,8 +27,8 @@ use walkdir::WalkDir;
 
 use crate::discovery::DetectionResult;
 use crate::model::{
-    CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
-    parse_timestamp, reindex_messages, truncate_title,
+    CanonicalMessage, CanonicalSession, MessageRole, normalize_role, parse_timestamp,
+    reindex_messages, truncate_title,
 };
 use crate::providers::{Provider, WriteOptions, WrittenSession};
 
@@ -127,6 +127,49 @@ impl Provider for Gemini {
                 chats.is_dir().then_some(chats)
             })
             .collect()
+    }
+
+    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+        let tmp = Self::tmp_dir()?;
+        if !tmp.is_dir() {
+            return Some(vec![]);
+        }
+
+        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+        for entry in WalkDir::new(&tmp)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if parent.file_name().and_then(|n| n.to_str()) != Some("chats") {
+                continue;
+            }
+
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("session-") && name.ends_with(".json")) {
+                continue;
+            }
+
+            let session_id = session_id_from_file(path).unwrap_or_else(|| {
+                name.strip_prefix("session-")
+                    .and_then(|n| n.strip_suffix(".json"))
+                    .unwrap_or(name)
+                    .to_string()
+            });
+            sessions.push((session_id, path.to_path_buf()));
+        }
+
+        Some(sessions)
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -228,7 +271,7 @@ impl Provider for Gemini {
 
             // Content: string or array of content parts.
             let content_val = msg.get("content");
-            let text = content_val.map(flatten_content).unwrap_or_default();
+            let text = gemini_extract_text_content(content_val);
             if text.trim().is_empty() {
                 trace!(index = i, "skipping empty Gemini message");
                 continue;
@@ -406,6 +449,41 @@ fn gemini_message_type(msg: &CanonicalMessage) -> String {
         MessageRole::Tool => "tool".to_string(),
         MessageRole::System => "system".to_string(),
         MessageRole::Other(ref other) => other.clone(),
+    }
+}
+
+fn gemini_extract_text_content(content: Option<&serde_json::Value>) -> String {
+    let Some(value) = content else {
+        return String::new();
+    };
+
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => {
+            let mut text_parts: Vec<String> = Vec::new();
+            for part in parts {
+                match part {
+                    serde_json::Value::String(s) => text_parts.push(s.clone()),
+                    serde_json::Value::Object(obj) => {
+                        let block_type = obj.get("type").and_then(|v| v.as_str());
+                        if (matches!(block_type, Some("text") | Some("input_text"))
+                            || block_type.is_none())
+                            && let Some(text) = obj.get("text").and_then(|v| v.as_str())
+                        {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            text_parts.join("\n")
+        }
+        serde_json::Value::Object(obj) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
     }
 }
 
@@ -727,6 +805,24 @@ mod tests {
                     {"type": "model", "content": [
                         {"type": "text", "text": "Main answer."},
                         {"type": "grounding", "source": "doc://ref"}
+                    ]}
+                ]
+            }"#,
+        );
+        assert_eq!(session.messages[1].content, "Main answer.");
+    }
+
+    #[test]
+    fn reader_ignores_tool_blocks_when_flattening_text() {
+        let session = read_gemini_json(
+            r#"{
+                "sessionId": "gmi-tool-blocks",
+                "messages": [
+                    {"type": "user", "content": "Q"},
+                    {"type": "model", "content": [
+                        {"type": "text", "text": "Main answer."},
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "ok"}
                     ]}
                 ]
             }"#,

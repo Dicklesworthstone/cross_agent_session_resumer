@@ -5,7 +5,7 @@
 //! CLI entry point: parses arguments, dispatches subcommands, renders output.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use chrono::{Local, Utc};
@@ -15,7 +15,6 @@ use rich_rust::prelude::{Column, Console, JustifyMethod, Style, Table};
 use tracing_subscriber::EnvFilter;
 
 use casr::discovery::ProviderRegistry;
-use casr::model::truncate_title;
 use casr::pipeline::{ConversionPipeline, ConvertOptions};
 
 /// Cross Agent Session Resumer — resume AI coding sessions across providers.
@@ -422,6 +421,14 @@ fn cmd_list(
                 "path": self.path.display().to_string(),
             })
         }
+
+        fn session_id_display(&self) -> String {
+            let id = self.session_id.as_str();
+            if id.len() <= 24 {
+                return id.to_string();
+            }
+            format!("{}…{}", &id[..10], &id[id.len() - 8..])
+        }
     }
 
     fn expand_tilde_path(value: &str) -> PathBuf {
@@ -431,6 +438,130 @@ fn cmd_list(
             home.join(rest)
         } else {
             PathBuf::from(value)
+        }
+    }
+
+    fn file_mtime_millis(path: &Path) -> i64 {
+        path.metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|dur| i64::try_from(dur.as_millis()).ok())
+            .unwrap_or(0)
+    }
+
+    fn probe_limit_for_sort(limit: usize, sort: &str, workspace_scoped: bool) -> usize {
+        if sort == "date" {
+            // Cap expensive provider scans while preserving high confidence for
+            // "most recent" results. Workspace-scoped lists can use a tighter cap.
+            let multiplier = if workspace_scoped { 3 } else { 8 };
+            std::cmp::max(limit.saturating_mul(multiplier), 30)
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn workspace_hint_matches(
+        provider_slug: &str,
+        path: &Path,
+        workspace_filter: Option<&PathBuf>,
+    ) -> bool {
+        let Some(ws) = workspace_filter else {
+            return true;
+        };
+
+        match provider_slug {
+            "claude-code" => {
+                let expected = casr::providers::claude_code::project_dir_key(ws.as_path());
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(expected.as_str())
+            }
+            "gemini" => {
+                let _ = ws;
+                let _ = path;
+                // Gemini stores sessions under a project hash directory, but we
+                // still allow non-hash fixture layouts and legacy structures.
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn workspace_scoped_listed_sessions(
+        provider_slug: &str,
+        workspace_filter: Option<&PathBuf>,
+    ) -> Option<Vec<(String, PathBuf)>> {
+        let ws = workspace_filter?;
+        match provider_slug {
+            "claude-code" => {
+                let claude_home = std::env::var("CLAUDE_HOME")
+                    .ok()
+                    .map(PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+                let expected_dir = claude_home
+                    .join("projects")
+                    .join(casr::providers::claude_code::project_dir_key(ws.as_path()));
+                if !expected_dir.is_dir() {
+                    return None;
+                }
+
+                let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+                let entries = match std::fs::read_dir(&expected_dir) {
+                    Ok(entries) => entries,
+                    Err(_) => return Some(vec![]),
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+                    {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    sessions.push((stem.to_string(), path));
+                }
+                Some(sessions)
+            }
+            "gemini" => {
+                let gemini_home = std::env::var("GEMINI_HOME")
+                    .ok()
+                    .map(PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".gemini")))?;
+                let hash = casr::providers::gemini::project_hash(ws.as_path());
+                let chats_dir = gemini_home.join("tmp").join(hash).join("chats");
+                if !chats_dir.is_dir() {
+                    return None;
+                }
+
+                let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+                let entries = match std::fs::read_dir(&chats_dir) {
+                    Ok(entries) => entries,
+                    Err(_) => return None,
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if !(name.starts_with("session-") && name.ends_with(".json")) {
+                        continue;
+                    }
+                    let session_id = name
+                        .strip_prefix("session-")
+                        .and_then(|n| n.strip_suffix(".json"))
+                        .unwrap_or(name)
+                        .to_string();
+                    sessions.push((session_id, path));
+                }
+                Some(sessions)
+            }
+            _ => None,
         }
     }
 
@@ -454,8 +585,20 @@ fn cmd_list(
 
         // Prefer list_sessions() for providers that store multiple sessions
         // in a single file/DB (avoids undercounting).
-        if let Some(listed) = provider.list_sessions() {
+        let scoped_listed =
+            workspace_scoped_listed_sessions(provider.slug(), workspace_filter.as_ref());
+        if let Some(listed) = scoped_listed.or_else(|| provider.list_sessions()) {
+            let mut listed = listed;
+            let probe_limit = probe_limit_for_sort(limit, sort, workspace_filter.is_some());
+            if listed.len() > probe_limit {
+                listed.sort_by_key(|(_, path)| std::cmp::Reverse(file_mtime_millis(path)));
+                listed.truncate(probe_limit);
+            }
+
             for (session_id, path) in listed {
+                if !workspace_hint_matches(provider.slug(), &path, workspace_filter.as_ref()) {
+                    continue;
+                }
                 match provider.read_session(&path) {
                     Ok(session) => {
                         sessions.push(SessionSummary {
@@ -474,6 +617,8 @@ fn cmd_list(
             }
             continue;
         }
+
+        let mut candidate_paths: Vec<PathBuf> = Vec::new();
 
         for root in provider.session_roots() {
             let walker = walkdir::WalkDir::new(&root)
@@ -499,21 +644,35 @@ fn cmd_list(
                     continue;
                 }
 
-                // Try to read session metadata.
-                match provider.read_session(path) {
-                    Ok(session) => {
-                        sessions.push(SessionSummary {
-                            session_id: session.session_id,
-                            provider: provider.slug().to_string(),
-                            title: session.title,
-                            messages: session.messages.len(),
-                            workspace: session.workspace,
-                            started_at: session.started_at,
-                            path: path.to_path_buf(),
-                        });
-                    }
-                    Err(_) => continue,
+                if !workspace_hint_matches(provider.slug(), path, workspace_filter.as_ref()) {
+                    continue;
                 }
+
+                candidate_paths.push(path.to_path_buf());
+            }
+        }
+
+        let probe_limit = probe_limit_for_sort(limit, sort, workspace_filter.is_some());
+        if candidate_paths.len() > probe_limit {
+            candidate_paths.sort_by_key(|path| std::cmp::Reverse(file_mtime_millis(path)));
+            candidate_paths.truncate(probe_limit);
+        }
+
+        for path in candidate_paths {
+            // Try to read session metadata.
+            match provider.read_session(&path) {
+                Ok(session) => {
+                    sessions.push(SessionSummary {
+                        session_id: session.session_id,
+                        provider: provider.slug().to_string(),
+                        title: session.title,
+                        messages: session.messages.len(),
+                        workspace: session.workspace,
+                        started_at: session.started_at,
+                        path,
+                    });
+                }
+                Err(_) => continue,
             }
         }
     }
@@ -569,23 +728,21 @@ fn cmd_list(
             .border_style(Style::parse("cyan").unwrap_or_default())
             .with_column(Column::new("#").justify(JustifyMethod::Right).width(3))
             .with_column(Column::new("Provider").min_width(12))
-            .with_column(Column::new("Session ID").min_width(36))
+            .with_column(Column::new("Session ID").min_width(20))
             .with_column(Column::new("Msgs").justify(JustifyMethod::Right).width(6))
-            .with_column(Column::new("Started").min_width(16))
-            .with_column(Column::new("Title").min_width(24));
+            .with_column(Column::new("Started").min_width(16));
 
         for (idx, s) in sessions.iter().enumerate() {
             let rank = (idx + 1).to_string();
+            let session_id = s.session_id_display();
             let messages = s.messages.to_string();
             let started = s.started_at_display();
-            let title = truncate_title(s.title.as_deref().unwrap_or(""), 72);
             table.add_row_cells([
                 rank.as_str(),
                 s.provider.as_str(),
-                s.session_id.as_str(),
+                session_id.as_str(),
                 messages.as_str(),
                 started.as_str(),
-                title.as_str(),
             ]);
         }
 

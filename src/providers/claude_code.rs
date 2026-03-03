@@ -109,6 +109,52 @@ impl Provider for ClaudeCode {
         }
     }
 
+    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+        let projects_dir = Self::projects_dir()?;
+        if !projects_dir.is_dir() {
+            return Some(vec![]);
+        }
+
+        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+        let project_entries = match std::fs::read_dir(&projects_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Some(vec![]),
+        };
+
+        for project_entry in project_entries.flatten() {
+            let project_path = project_entry.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+
+            let session_entries = match std::fs::read_dir(&project_path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for session_entry in session_entries.flatten() {
+                let path = session_entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let session_id = claude_session_id_hint(&path).unwrap_or_else(|| stem.to_string());
+                if session_id.trim().is_empty() {
+                    continue;
+                }
+                sessions.push((session_id, path));
+            }
+        }
+
+        Some(sessions)
+    }
+
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         let projects_dir = Self::projects_dir()?;
         if !projects_dir.is_dir() {
@@ -543,6 +589,22 @@ fn build_inner_message(
         inner_msg["model"] = serde_json::Value::String(model.to_string());
     }
     inner_msg
+}
+
+fn claude_session_id_hint(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok).take(8) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        if let Some(session_id) = entry.get("sessionId").and_then(|v| v.as_str()) {
+            return Some(session_id.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

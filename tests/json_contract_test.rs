@@ -106,19 +106,35 @@ fn setup_codex_fixture(tmp: &TempDir, fixture_name: &str, ext: &str) -> String {
 }
 
 fn setup_gemini_fixture(tmp: &TempDir, fixture_name: &str) -> String {
+    setup_gemini_fixture_custom(tmp, fixture_name, None)
+}
+
+fn setup_gemini_fixture_custom(
+    tmp: &TempDir,
+    fixture_name: &str,
+    workspace_hint: Option<&str>,
+) -> String {
     let source = fixtures_dir().join(format!("gemini/{fixture_name}.json"));
     let content = fs::read_to_string(&source)
         .unwrap_or_else(|e| panic!("Failed to read fixture {fixture_name}: {e}"));
 
-    let root: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let mut root: serde_json::Value = serde_json::from_str(&content).unwrap();
     let session_id = root["sessionId"].as_str().unwrap_or("unknown").to_string();
+
+    if let Some(workspace) = workspace_hint
+        && let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut())
+        && let Some(first) = messages.first_mut()
+    {
+        first["content"] = serde_json::Value::String(format!("Workspace: {workspace}"));
+    }
 
     let hash_dir = tmp.path().join("gemini/tmp/testhash123/chats");
     fs::create_dir_all(&hash_dir).expect("create Gemini chats dir");
 
     let filename = format!("session-{session_id}.json");
     let target_path = hash_dir.join(&filename);
-    fs::write(&target_path, &content).expect("write Gemini fixture");
+    fs::write(&target_path, serde_json::to_string_pretty(&root).unwrap())
+        .expect("write Gemini fixture");
 
     session_id
 }
@@ -375,7 +391,7 @@ fn contract_list_json_shape_cc() {
     setup_cc_fixture(&tmp, "cc_simple");
 
     let output = casr_cmd(&tmp)
-        .args(["--json", "list"])
+        .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
         .expect("list should run");
 
@@ -401,7 +417,7 @@ fn contract_list_json_shape_codex() {
     setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
     let output = casr_cmd(&tmp)
-        .args(["--json", "list"])
+        .args(["--json", "list", "--workspace", "/data/projects/backend"])
         .output()
         .expect("list should run");
 
@@ -422,10 +438,19 @@ fn contract_list_json_shape_codex() {
 #[test]
 fn contract_list_json_shape_gemini() {
     let tmp = TempDir::new().unwrap();
-    setup_gemini_fixture(&tmp, "gmi_simple");
+    setup_gemini_fixture_custom(
+        &tmp,
+        "gmi_simple",
+        Some("/data/projects/cross_agent_session_resumer"),
+    );
 
     let output = casr_cmd(&tmp)
-        .args(["--json", "list"])
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            "/data/projects/cross_agent_session_resumer",
+        ])
         .output()
         .expect("list should run");
 
@@ -448,7 +473,10 @@ fn contract_list_json_messages_is_nonnegative() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp).args(["--json", "list"]).output().unwrap();
+    let output = casr_cmd(&tmp)
+        .args(["--json", "list", "--workspace", "/data/projects/myapp"])
+        .output()
+        .unwrap();
 
     let parsed: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
@@ -759,6 +787,21 @@ fn assert_error_envelope(obj: &serde_json::Value) {
     assert_string(&obj["message"], "message", ctx);
 }
 
+fn parse_json_from_maybe_logged_stream(raw: &str, stream_name: &str) -> serde_json::Value {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+        return parsed;
+    }
+
+    if let Some(idx) = raw.find('{') {
+        let candidate = &raw[idx..];
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(candidate) {
+            return parsed;
+        }
+    }
+
+    panic!("Invalid JSON in {stream_name}: {raw}");
+}
+
 #[test]
 fn contract_error_json_unknown_session() {
     let tmp = TempDir::new().unwrap();
@@ -769,8 +812,7 @@ fn contract_error_json_unknown_session() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let parsed: serde_json::Value = serde_json::from_str(&stderr)
-        .unwrap_or_else(|e| panic!("Invalid JSON error: {e}\nStderr: {stderr}"));
+    let parsed = parse_json_from_maybe_logged_stream(&stderr, "stderr");
 
     assert_error_envelope(&parsed);
     assert_eq!(parsed["error_type"].as_str().unwrap(), "SessionNotFound");
@@ -788,8 +830,7 @@ fn contract_error_json_unknown_provider() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let parsed: serde_json::Value = serde_json::from_str(&stderr)
-        .unwrap_or_else(|e| panic!("Invalid JSON error: {e}\nStderr: {stderr}"));
+    let parsed = parse_json_from_maybe_logged_stream(&stderr, "stderr");
 
     assert_error_envelope(&parsed);
     assert_eq!(
@@ -808,8 +849,7 @@ fn contract_error_json_unknown_resume_session() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let parsed: serde_json::Value = serde_json::from_str(&stderr)
-        .unwrap_or_else(|e| panic!("Invalid JSON error: {e}\nStderr: {stderr}"));
+    let parsed = parse_json_from_maybe_logged_stream(&stderr, "stderr");
 
     assert_error_envelope(&parsed);
     assert_eq!(parsed["error_type"].as_str().unwrap(), "SessionNotFound");
@@ -824,7 +864,7 @@ fn contract_error_json_message_is_nonempty() {
         .unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    let parsed = parse_json_from_maybe_logged_stream(&stderr, "stderr");
 
     let msg = parsed["message"].as_str().unwrap();
     assert!(!msg.is_empty(), "error message should not be empty");
