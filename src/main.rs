@@ -4,11 +4,14 @@
 //!
 //! CLI entry point: parses arguments, dispatches subcommands, renders output.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use chrono::{Local, Utc};
 use clap::Parser;
 use colored::Colorize;
+use rich_rust::prelude::{Column, Console, JustifyMethod, Style, Table};
 use tracing_subscriber::EnvFilter;
 
 use casr::discovery::ProviderRegistry;
@@ -80,7 +83,7 @@ enum Command {
         workspace: Option<String>,
 
         /// Maximum sessions to show.
-        #[arg(long, default_value = "50")]
+        #[arg(long, default_value = "10")]
         limit: usize,
 
         /// Sort field (date, messages, provider).
@@ -140,8 +143,71 @@ fn init_tracing(cli: &Cli) {
         .init();
 }
 
+/// Rewrite ergonomic shorthand target flags into canonical resume commands.
+///
+/// Supports:
+/// - `casr -cc <session-id> ...`
+/// - `casr -cod <session-id> ...`
+/// - `casr -gmi <session-id> ...`
+///
+/// Rewritten form:
+/// `casr [global-options] resume <target> <session-id> ...`
+fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() < 2 {
+        return args;
+    }
+
+    let mut shorthand_idx: Option<usize> = None;
+    let mut target_alias: Option<&'static str> = None;
+
+    // Only scan option-like tokens before the first positional token.
+    // This preserves regular subcommand behavior (e.g., `casr list`).
+    for (idx, arg) in args.iter().enumerate().skip(1) {
+        let raw = arg.to_string_lossy();
+        if raw == "--" {
+            break;
+        }
+        if !raw.starts_with('-') {
+            break;
+        }
+
+        let alias = match raw.as_ref() {
+            "-cc" => Some("cc"),
+            "-cod" => Some("cod"),
+            "-gmi" => Some("gmi"),
+            _ => None,
+        };
+
+        if let Some(a) = alias {
+            shorthand_idx = Some(idx);
+            target_alias = Some(a);
+            break;
+        }
+    }
+
+    let (idx, alias) = match (shorthand_idx, target_alias) {
+        (Some(i), Some(a)) => (i, a),
+        _ => return args,
+    };
+
+    let mut rewritten = Vec::with_capacity(args.len() + 1);
+    rewritten.push(args[0].clone());
+
+    // Preserve any global options before the shorthand flag.
+    rewritten.extend(args.iter().take(idx).skip(1).cloned());
+
+    rewritten.push(OsString::from("resume"));
+    rewritten.push(OsString::from(alias));
+
+    // Preserve the remaining args after shorthand (session id + options).
+    rewritten.extend(args.into_iter().skip(idx + 1));
+
+    rewritten
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let argv = rewrite_shorthand_resume_args(std::env::args_os().collect());
+    let cli = Cli::parse_from(argv);
     init_tracing(&cli);
 
     let result = match cli.command {
@@ -334,6 +400,17 @@ fn cmd_list(
             self.started_at.unwrap_or(0)
         }
 
+        fn started_at_display(&self) -> String {
+            self.started_at
+                .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+                .map(|dt| {
+                    dt.with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "-".to_string())
+        }
+
         fn to_json(&self) -> serde_json::Value {
             serde_json::json!({
                 "session_id": self.session_id,
@@ -357,7 +434,13 @@ fn cmd_list(
         }
     }
 
-    let workspace_filter = workspace_filter.map(expand_tilde_path);
+    let workspace_filter = workspace_filter
+        .map(expand_tilde_path)
+        .or_else(|| std::env::current_dir().ok());
+    let workspace_scope = workspace_filter
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "all workspaces".to_string());
 
     let mut sessions: Vec<SessionSummary> = Vec::new();
 
@@ -465,31 +548,49 @@ fn cmd_list(
     } else {
         if sessions.is_empty() {
             println!(
-                "No sessions found. Run {} to check provider status.",
-                "casr providers".cyan()
+                "No sessions found for workspace {}. Run {} to check provider status.",
+                workspace_scope.cyan(),
+                "casr providers".cyan(),
             );
             return Ok(());
         }
-        println!(
-            "{} ({} sessions)\n",
-            "Discoverable sessions".bold(),
-            sessions.len()
-        );
-        for s in &sessions {
-            let sid = &s.session_id;
-            let prov = &s.provider;
-            let title = s.title.as_deref().unwrap_or("");
-            let msgs = s.messages;
-            let display_title = truncate_title(title, 60);
 
-            println!(
-                "  {} {} {} {}",
-                sid.cyan(),
-                format!("[{prov}]").dimmed(),
-                format!("{msgs}msg").dimmed(),
-                display_title
-            );
+        let console = Console::new();
+        console.print(&format!(
+            "[bold cyan]Recent sessions[/] in [bold]{workspace_scope}[/]"
+        ));
+
+        let mut table = Table::new()
+            .title(format!(
+                "Top {} Most Recent Sessions Across Detected Providers",
+                sessions.len()
+            ))
+            .header_style(Style::parse("bold white on blue").unwrap_or_default())
+            .border_style(Style::parse("cyan").unwrap_or_default())
+            .with_column(Column::new("#").justify(JustifyMethod::Right).width(3))
+            .with_column(Column::new("Provider").min_width(12))
+            .with_column(Column::new("Session ID").min_width(36))
+            .with_column(Column::new("Msgs").justify(JustifyMethod::Right).width(6))
+            .with_column(Column::new("Started").min_width(16))
+            .with_column(Column::new("Title").min_width(24));
+
+        for (idx, s) in sessions.iter().enumerate() {
+            let rank = (idx + 1).to_string();
+            let messages = s.messages.to_string();
+            let started = s.started_at_display();
+            let title = truncate_title(s.title.as_deref().unwrap_or(""), 72);
+            table.add_row_cells([
+                rank.as_str(),
+                s.provider.as_str(),
+                s.session_id.as_str(),
+                messages.as_str(),
+                started.as_str(),
+                title.as_str(),
+            ]);
         }
+
+        console.print_renderable(&table);
+        console.print("[dim]Tip:[/] run [bold]casr info <session-id>[/] for full metadata.");
     }
 
     Ok(())

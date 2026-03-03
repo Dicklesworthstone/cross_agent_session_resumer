@@ -51,22 +51,37 @@ fn casr_cmd(tmp: &TempDir) -> Command {
 /// Creates the expected directory structure:
 /// `<claude_home>/projects/<project-key>/<session-id>.jsonl`
 fn setup_cc_fixture(tmp: &TempDir, fixture_name: &str) -> String {
+    setup_cc_fixture_custom(tmp, fixture_name, None, None)
+}
+
+/// Set up a Claude Code session fixture with optional workspace/session-id overrides.
+fn setup_cc_fixture_custom(
+    tmp: &TempDir,
+    fixture_name: &str,
+    workspace_override: Option<&str>,
+    session_id_override: Option<&str>,
+) -> String {
     let source = fixtures_dir().join(format!("claude_code/{fixture_name}.jsonl"));
-    let content = fs::read_to_string(&source)
+    let original_content = fs::read_to_string(&source)
         .unwrap_or_else(|e| panic!("Failed to read fixture {fixture_name}: {e}"));
 
     // Extract session ID and cwd from the fixture content.
-    let first_line: serde_json::Value = content
+    let first_line: serde_json::Value = original_content
         .lines()
         .find(|l| !l.trim().is_empty())
         .and_then(|l| serde_json::from_str(l).ok())
         .expect("fixture should have valid first line");
 
-    let session_id = first_line["sessionId"]
-        .as_str()
-        .unwrap_or("unknown")
+    let original_session_id = first_line["sessionId"].as_str().unwrap_or("unknown");
+    let original_cwd = first_line["cwd"].as_str().unwrap_or("/tmp");
+    let session_id = session_id_override
+        .unwrap_or(original_session_id)
         .to_string();
-    let cwd = first_line["cwd"].as_str().unwrap_or("/tmp");
+    let cwd = workspace_override.unwrap_or(original_cwd);
+
+    let content = original_content
+        .replace(original_session_id, &session_id)
+        .replace(original_cwd, cwd);
 
     // Derive project key: replace non-alphanumeric with dash.
     let project_key: String = cwd
@@ -236,7 +251,7 @@ fn cli_list_finds_cc_sessions() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
     casr_cmd(&tmp)
-        .arg("list")
+        .args(["list", "--workspace", "/data/projects/myapp"])
         .assert()
         .success()
         .stdout(predicate::str::contains(&session_id));
@@ -247,7 +262,7 @@ fn cli_list_json_is_valid_array() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
     let output = casr_cmd(&tmp)
-        .args(["--json", "list"])
+        .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
         .expect("list should run");
 
@@ -263,9 +278,16 @@ fn cli_list_json_is_valid_array() {
 fn cli_list_limit_respects_bound() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
-    setup_cc_fixture(&tmp, "cc_malformed");
+    setup_cc_fixture_custom(&tmp, "cc_malformed", Some("/data/projects/myapp"), None);
     let output = casr_cmd(&tmp)
-        .args(["--json", "list", "--limit", "1"])
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            "/data/projects/myapp",
+            "--limit",
+            "1",
+        ])
         .output()
         .expect("list should run");
 
@@ -308,10 +330,20 @@ fn cli_list_workspace_filter_filters_sessions() {
 fn cli_list_sort_messages_orders_descending() {
     let tmp = TempDir::new().unwrap();
     let simple_id = setup_cc_fixture(&tmp, "cc_simple");
-    let complex_id = setup_cc_fixture(&tmp, "cc_complex");
+    let complex_id =
+        setup_cc_fixture_custom(&tmp, "cc_complex", Some("/data/projects/myapp"), None);
 
     let output = casr_cmd(&tmp)
-        .args(["--json", "list", "--sort", "messages", "--limit", "2"])
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            "/data/projects/myapp",
+            "--sort",
+            "messages",
+            "--limit",
+            "2",
+        ])
         .output()
         .expect("list should run");
 
@@ -521,6 +553,128 @@ fn cli_resume_cc_to_gemini_works() {
         files.len(),
         1,
         "Exactly one Gemini session file should be written"
+    );
+}
+
+#[test]
+fn cli_resume_shorthand_cod_flag_works() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    casr_cmd(&tmp)
+        .args(["-cod", &session_id, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would convert"))
+        .stdout(predicate::str::contains("codex"));
+}
+
+#[test]
+fn cli_resume_shorthand_cc_flag_works() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
+
+    casr_cmd(&tmp)
+        .args(["-cc", &session_id, "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would convert"))
+        .stdout(predicate::str::contains("claude-code"));
+}
+
+#[test]
+fn cli_resume_shorthand_gmi_flag_works_in_json_mode() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "-gmi", &session_id, "--dry-run"])
+        .output()
+        .expect("shorthand -gmi should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("shorthand -gmi should emit valid JSON");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["source_provider"].as_str().unwrap(), "claude-code");
+    assert_eq!(parsed["target_provider"].as_str().unwrap(), "gemini");
+    assert_eq!(parsed["dry_run"], true);
+}
+
+#[test]
+fn cli_list_defaults_to_current_workspace_and_top_10() {
+    let tmp = TempDir::new().unwrap();
+    let current_ws = std::env::current_dir().expect("current dir should be available");
+    let current_ws_str = current_ws.display().to_string();
+
+    // Create 12 sessions in the current workspace context.
+    for i in 0..12 {
+        let sid = format!("11111111-1111-4111-8111-{i:012}");
+        setup_cc_fixture_custom(&tmp, "cc_simple", Some(&current_ws_str), Some(&sid));
+    }
+
+    // Create one session in another workspace; default list should exclude it.
+    let out_of_scope_sid = "99999999-9999-4999-8999-999999999999";
+    setup_cc_fixture_custom(
+        &tmp,
+        "cc_simple",
+        Some("/tmp/not-current-casr-workspace"),
+        Some(out_of_scope_sid),
+    );
+
+    // Default list: current workspace + top 10 recent.
+    let output = casr_cmd(&tmp)
+        .args(["--json", "list"])
+        .output()
+        .expect("list should run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("list --json should emit valid JSON");
+    let arr = parsed
+        .as_array()
+        .expect("list --json should return an array of sessions");
+
+    assert_eq!(
+        arr.len(),
+        10,
+        "default list should return the top 10 sessions"
+    );
+    for entry in arr {
+        let ws = entry["workspace"].as_str().unwrap_or("");
+        assert!(
+            ws.starts_with(&current_ws_str),
+            "default list should stay scoped to current workspace, got workspace={ws}"
+        );
+        let sid = entry["session_id"].as_str().unwrap_or("");
+        assert_ne!(
+            sid, out_of_scope_sid,
+            "out-of-scope workspace session should not be included by default"
+        );
+    }
+
+    // Explicit workspace override should include the out-of-scope session.
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            "/tmp/not-current-casr-workspace",
+        ])
+        .output()
+        .expect("list --workspace should run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("list --workspace --json should emit valid JSON");
+    let arr = parsed
+        .as_array()
+        .expect("list --workspace --json should return an array");
+    assert!(
+        arr.iter()
+            .any(|e| e["session_id"].as_str() == Some(out_of_scope_sid)),
+        "explicit workspace override should include out-of-scope fixture"
     );
 }
 
