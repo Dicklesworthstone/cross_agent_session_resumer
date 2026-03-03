@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use chrono::{Local, Utc};
 use clap::Parser;
 use colored::Colorize;
-use rich_rust::prelude::{Column, Console, JustifyMethod, Style, Table};
+use rich_rust::prelude::{Cell, Column, Console, JustifyMethod, Row, Style, Table};
 use tracing_subscriber::EnvFilter;
 
 use casr::discovery::ProviderRegistry;
@@ -458,13 +458,31 @@ fn cmd_list(
     }
 
     fn file_last_activity_millis(path: &Path) -> Option<i64> {
-        let meta = path.metadata().ok()?;
-        let modified = meta.modified().ok().and_then(system_time_to_epoch_millis);
-        let accessed = meta.accessed().ok().and_then(system_time_to_epoch_millis);
-        match (modified, accessed) {
-            (Some(modified), Some(accessed)) => Some(modified.max(accessed)),
-            (Some(modified), None) => Some(modified),
-            (None, Some(accessed)) => Some(accessed),
+        path.metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_to_epoch_millis)
+    }
+
+    fn session_activity_millis(
+        session: &casr::model::CanonicalSession,
+        path: &Path,
+    ) -> Option<i64> {
+        let conversation_activity = session
+            .ended_at
+            .or_else(|| {
+                session
+                    .messages
+                    .iter()
+                    .filter_map(|msg| msg.timestamp)
+                    .max()
+            })
+            .or(session.started_at);
+        let file_activity = file_last_activity_millis(path);
+        match (conversation_activity, file_activity) {
+            (Some(conversation), Some(file)) => Some(conversation.max(file)),
+            (Some(conversation), None) => Some(conversation),
+            (None, Some(file)) => Some(file),
             (None, None) => None,
         }
     }
@@ -483,23 +501,77 @@ fn cmd_list(
         format!("{days}d {hours:02}h {minutes:02}m {seconds:02}s {suffix}")
     }
 
-    fn provider_display(provider: &str) -> String {
+    fn provider_style(provider: &str) -> Style {
+        let style_str = match provider {
+            "claude-code" => "bold magenta",
+            "codex" => "bold cyan",
+            "gemini" => "bold yellow",
+            "cursor" => "bold blue",
+            "cline" => "bold green",
+            "aider" => "bold red",
+            "amp" => "bold bright_green",
+            "opencode" => "bold bright_magenta",
+            "chatgpt" => "bold bright_yellow",
+            "clawdbot" => "bold bright_cyan",
+            "vibe" => "bold white",
+            "factory" => "bold bright_blue",
+            "openclaw" => "bold bright_red",
+            "pi-agent" => "bold bright_white",
+            _ => "bold",
+        };
+        Style::parse(style_str).unwrap_or_default()
+    }
+
+    fn message_count_style(message_count: usize) -> Style {
+        let style_str = if message_count >= 200 {
+            "bold bright_cyan"
+        } else if message_count >= 50 {
+            "bold cyan"
+        } else if message_count >= 10 {
+            "bold blue"
+        } else {
+            "bold dim"
+        };
+        Style::parse(style_str).unwrap_or_default()
+    }
+
+    fn last_active_style(last_active_at: Option<i64>, now_millis: i64) -> Style {
+        let Some(last_active_at) = last_active_at else {
+            return Style::parse("dim").unwrap_or_default();
+        };
+        let age_seconds =
+            u64::try_from(now_millis.saturating_sub(last_active_at).max(0) / 1000).unwrap_or(0);
+        let style_str = if age_seconds < 3_600 {
+            "bold bright_green"
+        } else if age_seconds < 86_400 {
+            "bold green"
+        } else if age_seconds < 604_800 {
+            "bold yellow"
+        } else if age_seconds < 2_592_000 {
+            "bold magenta"
+        } else {
+            "bold dim"
+        };
+        Style::parse(style_str).unwrap_or_default()
+    }
+
+    fn provider_display(provider: &str) -> &str {
         match provider {
-            "claude-code" => provider.bright_magenta().bold().to_string(),
-            "codex" => provider.bright_cyan().bold().to_string(),
-            "gemini" => provider.bright_yellow().bold().to_string(),
-            "cursor" => provider.bright_blue().bold().to_string(),
-            "cline" => provider.bright_green().bold().to_string(),
-            "aider" => provider.bright_red().bold().to_string(),
-            "amp" => provider.green().bold().to_string(),
-            "opencode" => provider.magenta().bold().to_string(),
-            "chatgpt" => provider.yellow().bold().to_string(),
-            "clawdbot" => provider.cyan().bold().to_string(),
-            "vibe" => provider.bright_white().bold().to_string(),
-            "factory" => provider.blue().bold().to_string(),
-            "openclaw" => provider.red().bold().to_string(),
-            "pi-agent" => provider.white().bold().to_string(),
-            _ => provider.bold().to_string(),
+            "claude-code" => "claude-code",
+            "codex" => "codex",
+            "gemini" => "gemini",
+            "cursor" => "cursor",
+            "cline" => "cline",
+            "aider" => "aider",
+            "amp" => "amp",
+            "opencode" => "opencode",
+            "chatgpt" => "chatgpt",
+            "clawdbot" => "clawdbot",
+            "vibe" => "vibe",
+            "factory" => "factory",
+            "openclaw" => "openclaw",
+            "pi-agent" => "pi-agent",
+            _ => provider,
         }
     }
 
@@ -705,7 +777,7 @@ fn cmd_list(
                 }
                 match provider.read_session(&path) {
                     Ok(session) => {
-                        let last_active_at = file_last_activity_millis(&path);
+                        let last_active_at = session_activity_millis(&session, &path);
                         sessions.push(SessionSummary {
                             session_id: session.session_id,
                             provider: provider.slug().to_string(),
@@ -768,7 +840,7 @@ fn cmd_list(
             // Try to read session metadata.
             match provider.read_session(&path) {
                 Ok(session) => {
-                    let last_active_at = file_last_activity_millis(&path);
+                    let last_active_at = session_activity_millis(&session, &path);
                     sessions.push(SessionSummary {
                         session_id: session.session_id,
                         provider: provider.slug().to_string(),
@@ -842,29 +914,44 @@ fn cmd_list(
             .header_style(Style::parse("bold white on blue").unwrap_or_default())
             .border_style(Style::parse("cyan").unwrap_or_default())
             .with_column(Column::new("#").justify(JustifyMethod::Right).width(3))
-            .with_column(Column::new("Provider").min_width(12))
+            .with_column(
+                Column::new("Provider")
+                    .justify(JustifyMethod::Left)
+                    .width(12),
+            )
             .with_column(Column::new("Session ID").min_width(36))
             .with_column(Column::new("Msgs").justify(JustifyMethod::Right).width(6))
-            .with_column(Column::new("Started").min_width(16))
-            .with_column(Column::new("Last Active").min_width(22));
+            .with_column(
+                Column::new("Started")
+                    .justify(JustifyMethod::Left)
+                    .width(16),
+            )
+            .with_column(
+                Column::new("Last Active")
+                    .justify(JustifyMethod::Left)
+                    .min_width(22),
+            );
 
         let now_millis = Utc::now().timestamp_millis();
 
         for (idx, s) in sessions.iter().enumerate() {
             let rank = (idx + 1).to_string();
             let provider = provider_display(&s.provider);
-            let session_id = s.session_id.clone();
+            let provider_cell_style = provider_style(provider);
+            let session_id = s.session_id.as_str();
             let messages = s.messages.to_string();
+            let messages_cell_style = message_count_style(s.messages);
             let started = s.started_at_display();
             let last_active = s.last_active_display(now_millis);
-            table.add_row_cells([
-                rank.as_str(),
-                provider.as_str(),
-                session_id.as_str(),
-                messages.as_str(),
-                started.as_str(),
-                last_active.as_str(),
-            ]);
+            let last_active_cell_style = last_active_style(s.last_active_at, now_millis);
+            table.add_row(Row::new(vec![
+                Cell::new(rank.as_str()),
+                Cell::new(provider).style(provider_cell_style),
+                Cell::new(session_id),
+                Cell::new(messages.as_str()).style(messages_cell_style),
+                Cell::new(started.as_str()),
+                Cell::new(last_active.as_str()).style(last_active_cell_style),
+            ]));
         }
 
         console.print_renderable(&table);
