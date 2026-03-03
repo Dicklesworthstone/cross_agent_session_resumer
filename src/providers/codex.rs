@@ -571,7 +571,7 @@ impl Codex {
                             continue;
                         }
 
-                        messages.push(CanonicalMessage {
+                        let next_message = CanonicalMessage {
                             idx: 0,
                             role,
                             content: text,
@@ -580,7 +580,23 @@ impl Codex {
                             tool_calls,
                             tool_results,
                             extra: envelope,
+                        };
+
+                        // Some Codex files mirror user turns in both
+                        // `response_item(message:user)` and `event_msg(user_message)`.
+                        // Drop exact adjacent duplicates to preserve clean alternation.
+                        let is_adjacent_user_duplicate = messages.last().is_some_and(|prev| {
+                            prev.role == MessageRole::User
+                                && next_message.role == MessageRole::User
+                                && prev.content == next_message.content
+                                && prev.timestamp == next_message.timestamp
                         });
+                        if is_adjacent_user_duplicate {
+                            trace!(line = line_num, "skipping duplicate user response_item");
+                            continue;
+                        }
+
+                        messages.push(next_message);
                     }
                 }
                 "event_msg" => {
@@ -594,7 +610,7 @@ impl Codex {
                                     .unwrap_or("")
                                     .to_string();
                                 if !text.trim().is_empty() {
-                                    messages.push(CanonicalMessage {
+                                    let next_message = CanonicalMessage {
                                         idx: 0,
                                         role: MessageRole::User,
                                         content: text,
@@ -603,7 +619,23 @@ impl Codex {
                                         tool_calls: vec![],
                                         tool_results: vec![],
                                         extra: envelope,
-                                    });
+                                    };
+
+                                    let is_adjacent_user_duplicate =
+                                        messages.last().is_some_and(|prev| {
+                                            prev.role == MessageRole::User
+                                                && prev.content == next_message.content
+                                                && prev.timestamp == next_message.timestamp
+                                        });
+                                    if is_adjacent_user_duplicate {
+                                        trace!(
+                                            line = line_num,
+                                            "skipping duplicate user event_msg"
+                                        );
+                                        continue;
+                                    }
+
+                                    messages.push(next_message);
                                 }
                             }
                             "agent_reasoning" => {
@@ -1126,6 +1158,22 @@ mod tests {
         assert_eq!(session.messages[1].content, "Running");
         assert_eq!(session.messages[1].tool_calls.len(), 1);
         assert_eq!(session.messages[1].tool_calls[0].name, "Bash");
+    }
+
+    #[test]
+    fn reader_jsonl_dedupes_mirrored_user_entries() {
+        let session = read_codex_jsonl(
+            r#"{"type":"session_meta","timestamp":1700000000.0,"payload":{"id":"dup-u","cwd":"/tmp"}}
+{"type":"response_item","timestamp":1700000001.0,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Same user turn"}]}}
+{"type":"event_msg","timestamp":1700000001.0,"payload":{"type":"user_message","message":"Same user turn"}}
+{"type":"response_item","timestamp":1700000002.0,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}}"#,
+        );
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(session.messages[0].content, "Same user turn");
+        assert_eq!(session.messages[1].role, MessageRole::Assistant);
+        assert_eq!(session.messages[1].content, "Answer");
     }
 
     #[test]
