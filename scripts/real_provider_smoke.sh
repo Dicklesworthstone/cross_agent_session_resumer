@@ -358,9 +358,13 @@ expand_accept_command() {
     local target_workspace="${4:-}"
     local template="${ACCEPT_TEMPLATE[$alias]}"
     if [[ -z "$template" ]]; then
-        if [[ "$alias" == "cc" && -n "$target_workspace" && -d "$target_workspace" ]]; then
+        local workspace_dir="$target_workspace"
+        if [[ -n "$workspace_dir" && ! -d "$workspace_dir" && -f "$workspace_dir" ]]; then
+            workspace_dir="$(dirname "$workspace_dir")"
+        fi
+        if [[ "$alias" == "cc" && -n "$workspace_dir" && -d "$workspace_dir" ]]; then
             local escaped_ws=""
-            printf -v escaped_ws '%q' "$target_workspace"
+            printf -v escaped_ws '%q' "$workspace_dir"
             echo "cd $escaped_ws && $resume_command"
             return 0
         fi

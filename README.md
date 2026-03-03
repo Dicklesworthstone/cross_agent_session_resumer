@@ -6,6 +6,14 @@ Cross Agent Session Resumer for coding agents: resume a session created in one p
 ![Status](https://img.shields.io/badge/status-active-green)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
 
+## Quick Install (Recommended)
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh?$(date +%s)" | bash
+```
+
+That installer is the primary distribution path. It handles platform detection, secure artifact verification, fallback source builds, shell completions, and agent-oriented local setup in one step.
+
 ## TL;DR
 
 **The Problem**: AI coding sessions are siloed by provider. A useful Codex session cannot be resumed directly in Claude Code, and vice versa.
@@ -93,24 +101,48 @@ Notes:
 
 ## Installation
 
-### One-Liner Install (Recommended)
+### Primary Path: Hardened `curl | bash` Installer
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh?$(date +%s)" | bash
 ```
 
-The installer automatically:
-- Downloads the correct binary for your platform (Linux/macOS, x86_64/ARM64)
-- Verifies SHA256 checksums and Sigstore signatures
-- Falls back to building from source if no prebuilt binary is available
-- Detects installed AI coding agent providers
-- Installs shell completions for your default shell
-- Supports `--offline TARBALL` for airgap environments
-- Supports proxy via `HTTPS_PROXY` / `HTTP_PROXY`
+What this installer does for you:
 
-Run `bash install.sh --help` for all options.
+| Capability | Behavior |
+|---|---|
+| Platform targeting | Detects Linux/macOS + x86_64/aarch64 and picks the right artifact |
+| Supply-chain checks | Verifies SHA256 and Sigstore/cosign when available |
+| Download fallback chain | Versioned release -> latest release naming variants -> source build |
+| Airgap install | `--offline <tarball>` installs from local artifacts |
+| Proxy-aware networking | Uses `HTTPS_PROXY` / `HTTP_PROXY` automatically |
+| Shell UX | Installs completions for bash/zsh/fish |
+| Agent setup | Installs `casr` skill for Claude/Codex and optional `cc`/`cod`/`gmi` wrappers |
 
-### From Source
+High-value installer flags:
+
+| Flag | Purpose |
+|---|---|
+| `--verify` | Runs post-install self-test |
+| `--force` | Reinstall even if same version is already present |
+| `--offline <tarball>` | Airgapped local install |
+| `--from-source` | Build from source directly |
+| `--easy-mode` | Auto-update PATH in shell rc files |
+| `--yes` | Non-interactive prompt acceptance |
+| `--no-configure` | Skip agent skill/wrapper setup |
+| `--no-skill` | Skip Claude/Codex skill installation |
+
+```bash
+# Examples
+bash install.sh --verify
+bash install.sh --system --easy-mode --yes
+bash install.sh --offline ./casr-x86_64-unknown-linux-musl.tar.xz
+bash install.sh --no-configure --no-skill
+```
+
+Run `bash install.sh --help` for the full option set.
+
+### Alternative: From Source
 
 ```bash
 git clone https://github.com/Dicklesworthstone/cross_agent_session_resumer
@@ -119,14 +151,14 @@ cargo build --release
 ./target/release/casr --help
 ```
 
-### Install as a Cargo Binary
+### Alternative: Cargo Local Install
 
 ```bash
 cargo install --path .
 casr --help
 ```
 
-### Development Mode
+### Alternative: Development Mode
 
 ```bash
 cargo run -- --help
@@ -182,8 +214,11 @@ Convert a source session into target provider format and print the target resume
 
 ```bash
 casr cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+casr claude resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # standard name fallback
 casr cod resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
+casr codex resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
 casr gmi resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
+casr gemini resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
 casr cc resume <session-id> --force
 casr cc resume <session-id> --json
 ```
