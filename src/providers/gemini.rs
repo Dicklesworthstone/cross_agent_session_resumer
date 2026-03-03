@@ -566,7 +566,7 @@ fn extract_workspace_from_messages(messages: &[CanonicalMessage]) -> Option<Path
             let parts: Vec<&str> = project_path.split('/').collect();
             if parts.len() >= 4 {
                 let normalized = format!("/{}/{}/{}", parts[1], parts[2], parts[3]);
-                return Some(PathBuf::from(normalized));
+                return normalize_workspace_candidate(&normalized);
             }
         }
         // Look for absolute paths on common prefixes.
@@ -578,12 +578,39 @@ fn extract_workspace_from_messages(messages: &[CanonicalMessage]) -> Option<Path
                     .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
                     .collect();
                 if path.len() > prefix.len() + 3 {
-                    return Some(PathBuf::from(path));
+                    return normalize_workspace_candidate(&path);
                 }
             }
         }
     }
     None
+}
+
+fn normalize_workspace_candidate(raw: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(raw);
+    if candidate.as_os_str().is_empty() {
+        return None;
+    }
+
+    if candidate.exists() && candidate.is_file() {
+        return candidate
+            .parent()
+            .map(Path::to_path_buf)
+            .or(Some(candidate));
+    }
+
+    let looks_like_file = candidate
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.contains('.') && !name.starts_with('.'));
+    if looks_like_file
+        && let Some(parent) = candidate.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        return Some(parent.to_path_buf());
+    }
+
+    Some(candidate)
 }
 
 fn session_id_from_file(path: &Path) -> Option<String> {
@@ -598,7 +625,7 @@ fn session_id_from_file(path: &Path) -> Option<String> {
 mod tests {
     use super::{
         Gemini, gemini_message_content, gemini_message_type, merge_gemini_extra_fields,
-        project_hash, session_filename,
+        normalize_workspace_candidate, project_hash, session_filename,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -615,6 +642,20 @@ mod tests {
             hash,
             "b7da685261f0fff76430fd68dd709a693a8abac1c72c19c49f2fd1c7424c6d4e"
         );
+    }
+
+    #[test]
+    fn workspace_candidate_file_path_normalizes_to_parent_dir() {
+        let got = normalize_workspace_candidate("/data/projects/foo/README.md")
+            .expect("workspace should normalize");
+        assert_eq!(got, Path::new("/data/projects/foo"));
+    }
+
+    #[test]
+    fn workspace_candidate_hidden_directory_is_preserved() {
+        let got = normalize_workspace_candidate("/home/ubuntu/.config")
+            .expect("workspace should normalize");
+        assert_eq!(got, Path::new("/home/ubuntu/.config"));
     }
 
     #[test]

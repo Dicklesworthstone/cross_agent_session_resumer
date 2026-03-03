@@ -382,6 +382,9 @@ fn cmd_list(
 ) -> anyhow::Result<()> {
     let registry = ProviderRegistry::default_registry();
     let installed = registry.installed_providers();
+    let provider_filter_slug = provider_filter
+        .and_then(|filter| registry.find_by_alias(filter).map(|p| p.slug().to_string()))
+        .or_else(|| provider_filter.map(|filter| filter.to_ascii_lowercase()));
 
     #[derive(Debug)]
     struct SessionSummary {
@@ -391,12 +394,13 @@ fn cmd_list(
         messages: usize,
         workspace: Option<PathBuf>,
         started_at: Option<i64>,
+        last_active_at: Option<i64>,
         path: PathBuf,
     }
 
     impl SessionSummary {
-        fn started_at_value(&self) -> i64 {
-            self.started_at.unwrap_or(0)
+        fn recency_value(&self) -> i64 {
+            self.last_active_at.or(self.started_at).unwrap_or(0)
         }
 
         fn started_at_display(&self) -> String {
@@ -407,6 +411,12 @@ fn cmd_list(
                         .format("%Y-%m-%d %H:%M")
                         .to_string()
                 })
+                .unwrap_or_else(|| "-".to_string())
+        }
+
+        fn last_active_display(&self, now_millis: i64) -> String {
+            self.last_active_at
+                .map(|timestamp| format_relative_age(timestamp, now_millis))
                 .unwrap_or_else(|| "-".to_string())
         }
 
@@ -421,14 +431,6 @@ fn cmd_list(
                 "path": self.path.display().to_string(),
             })
         }
-
-        fn session_id_display(&self) -> String {
-            let id = self.session_id.as_str();
-            if id.len() <= 24 {
-                return id.to_string();
-            }
-            format!("{}…{}", &id[..10], &id[id.len() - 8..])
-        }
     }
 
     fn expand_tilde_path(value: &str) -> PathBuf {
@@ -441,13 +443,64 @@ fn cmd_list(
         }
     }
 
+    fn system_time_to_epoch_millis(time: std::time::SystemTime) -> Option<i64> {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|dur| i64::try_from(dur.as_millis()).ok())
+    }
+
     fn file_mtime_millis(path: &Path) -> i64 {
         path.metadata()
-            .and_then(|meta| meta.modified())
             .ok()
-            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|dur| i64::try_from(dur.as_millis()).ok())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_to_epoch_millis)
             .unwrap_or(0)
+    }
+
+    fn file_last_activity_millis(path: &Path) -> Option<i64> {
+        let meta = path.metadata().ok()?;
+        let modified = meta.modified().ok().and_then(system_time_to_epoch_millis);
+        let accessed = meta.accessed().ok().and_then(system_time_to_epoch_millis);
+        match (modified, accessed) {
+            (Some(modified), Some(accessed)) => Some(modified.max(accessed)),
+            (Some(modified), None) => Some(modified),
+            (None, Some(accessed)) => Some(accessed),
+            (None, None) => None,
+        }
+    }
+
+    fn format_relative_age(timestamp_millis: i64, now_millis: i64) -> String {
+        let (delta_millis, suffix) = if now_millis >= timestamp_millis {
+            (now_millis.saturating_sub(timestamp_millis), "ago")
+        } else {
+            (timestamp_millis.saturating_sub(now_millis), "from now")
+        };
+        let total_seconds = u64::try_from(delta_millis / 1000).unwrap_or(0);
+        let days = total_seconds / 86_400;
+        let hours = (total_seconds % 86_400) / 3_600;
+        let minutes = (total_seconds % 3_600) / 60;
+        let seconds = total_seconds % 60;
+        format!("{days}d {hours:02}h {minutes:02}m {seconds:02}s {suffix}")
+    }
+
+    fn provider_display(provider: &str) -> String {
+        match provider {
+            "claude-code" => provider.bright_magenta().bold().to_string(),
+            "codex" => provider.bright_cyan().bold().to_string(),
+            "gemini" => provider.bright_yellow().bold().to_string(),
+            "cursor" => provider.bright_blue().bold().to_string(),
+            "cline" => provider.bright_green().bold().to_string(),
+            "aider" => provider.bright_red().bold().to_string(),
+            "amp" => provider.green().bold().to_string(),
+            "opencode" => provider.magenta().bold().to_string(),
+            "chatgpt" => provider.yellow().bold().to_string(),
+            "clawdbot" => provider.cyan().bold().to_string(),
+            "vibe" => provider.bright_white().bold().to_string(),
+            "factory" => provider.blue().bold().to_string(),
+            "openclaw" => provider.red().bold().to_string(),
+            "pi-agent" => provider.white().bold().to_string(),
+            _ => provider.bold().to_string(),
+        }
     }
 
     fn probe_limit_for_sort(limit: usize, sort: &str, workspace_scoped: bool) -> usize {
@@ -601,6 +654,7 @@ fn cmd_list(
         }
     }
 
+    let workspace_filter_explicit = workspace_filter.is_some();
     let workspace_filter = workspace_filter
         .map(expand_tilde_path)
         .or_else(|| std::env::current_dir().ok());
@@ -608,13 +662,27 @@ fn cmd_list(
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "all workspaces".to_string());
+    let workspace_scope_label = if workspace_filter_explicit {
+        "workspace project (--workspace)"
+    } else {
+        "current working-directory project"
+    };
+    tracing::debug!(
+        provider_filter = ?provider_filter_slug,
+        workspace = %workspace_scope,
+        scope = %workspace_scope_label,
+        sort,
+        limit,
+        "listing sessions"
+    );
 
     let mut sessions: Vec<SessionSummary> = Vec::new();
 
     for provider in &installed {
-        if let Some(filter) = provider_filter
-            && provider.cli_alias() != filter
-            && provider.slug() != filter
+        tracing::debug!(provider = provider.slug(), "scanning provider for sessions");
+        if let Some(filter_slug) = provider_filter_slug.as_deref()
+            && provider.slug() != filter_slug
+            && provider.cli_alias() != filter_slug
         {
             continue;
         }
@@ -637,6 +705,7 @@ fn cmd_list(
                 }
                 match provider.read_session(&path) {
                     Ok(session) => {
+                        let last_active_at = file_last_activity_millis(&path);
                         sessions.push(SessionSummary {
                             session_id: session.session_id,
                             provider: provider.slug().to_string(),
@@ -644,6 +713,7 @@ fn cmd_list(
                             messages: session.messages.len(),
                             workspace: session.workspace,
                             started_at: session.started_at,
+                            last_active_at,
                             path,
                         });
                     }
@@ -698,6 +768,7 @@ fn cmd_list(
             // Try to read session metadata.
             match provider.read_session(&path) {
                 Ok(session) => {
+                    let last_active_at = file_last_activity_millis(&path);
                     sessions.push(SessionSummary {
                         session_id: session.session_id,
                         provider: provider.slug().to_string(),
@@ -705,6 +776,7 @@ fn cmd_list(
                         messages: session.messages.len(),
                         workspace: session.workspace,
                         started_at: session.started_at,
+                        last_active_at,
                         path,
                     });
                 }
@@ -722,16 +794,16 @@ fn cmd_list(
     }
 
     match sort {
-        "date" => sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at_value())),
+        "date" => sessions.sort_by_key(|s| std::cmp::Reverse(s.recency_value())),
         "messages" => sessions.sort_by(|a, b| {
             b.messages
                 .cmp(&a.messages)
-                .then_with(|| b.started_at_value().cmp(&a.started_at_value()))
+                .then_with(|| b.recency_value().cmp(&a.recency_value()))
         }),
         "provider" => sessions.sort_by(|a, b| {
             a.provider
                 .cmp(&b.provider)
-                .then_with(|| b.started_at_value().cmp(&a.started_at_value()))
+                .then_with(|| b.recency_value().cmp(&a.recency_value()))
         }),
         other => {
             return Err(anyhow::anyhow!(
@@ -740,6 +812,7 @@ fn cmd_list(
         }
     }
     sessions.truncate(limit);
+    tracing::debug!(sessions = sessions.len(), sort, "list sessions complete");
 
     if json_mode {
         let json: Vec<serde_json::Value> = sessions.iter().map(SessionSummary::to_json).collect();
@@ -747,7 +820,8 @@ fn cmd_list(
     } else {
         if sessions.is_empty() {
             println!(
-                "No sessions found for workspace {}. Run {} to check provider status.",
+                "No sessions found for {} {}. Run {} to check provider status.",
+                workspace_scope_label.cyan(),
                 workspace_scope.cyan(),
                 "casr providers".cyan(),
             );
@@ -756,33 +830,40 @@ fn cmd_list(
 
         let console = Console::new();
         console.print(&format!(
-            "[bold cyan]Recent sessions[/] in [bold]{workspace_scope}[/]"
+            "[bold cyan]Project-scoped sessions[/] for [bold]{workspace_scope}[/]"
         ));
+        console.print(&format!("[dim]Scope:[/] [bold]{workspace_scope_label}[/]"));
 
         let mut table = Table::new()
             .title(format!(
-                "Top {} Most Recent Sessions Across Detected Providers",
+                "Top {} Most Recently Active Sessions in This Project",
                 sessions.len()
             ))
             .header_style(Style::parse("bold white on blue").unwrap_or_default())
             .border_style(Style::parse("cyan").unwrap_or_default())
             .with_column(Column::new("#").justify(JustifyMethod::Right).width(3))
             .with_column(Column::new("Provider").min_width(12))
-            .with_column(Column::new("Session ID").min_width(20))
+            .with_column(Column::new("Session ID").min_width(36))
             .with_column(Column::new("Msgs").justify(JustifyMethod::Right).width(6))
-            .with_column(Column::new("Started").min_width(16));
+            .with_column(Column::new("Started").min_width(16))
+            .with_column(Column::new("Last Active").min_width(22));
+
+        let now_millis = Utc::now().timestamp_millis();
 
         for (idx, s) in sessions.iter().enumerate() {
             let rank = (idx + 1).to_string();
-            let session_id = s.session_id_display();
+            let provider = provider_display(&s.provider);
+            let session_id = s.session_id.clone();
             let messages = s.messages.to_string();
             let started = s.started_at_display();
+            let last_active = s.last_active_display(now_millis);
             table.add_row_cells([
                 rank.as_str(),
-                s.provider.as_str(),
+                provider.as_str(),
                 session_id.as_str(),
                 messages.as_str(),
                 started.as_str(),
+                last_active.as_str(),
             ]);
         }
 

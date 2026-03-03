@@ -154,9 +154,18 @@ impl ProviderRegistry {
 
     /// Find a provider by its CLI alias (e.g. `"cc"`) or slug.
     pub fn find_by_alias(&self, alias: &str) -> Option<&dyn Provider> {
+        let normalized = normalize_provider_token(alias);
+        let canonical = canonical_provider_token(&normalized);
         self.providers
             .iter()
-            .find(|p| p.cli_alias() == alias || p.slug() == alias)
+            .find(|p| {
+                let alias_token = normalize_provider_token(p.cli_alias());
+                let slug_token = normalize_provider_token(p.slug());
+                alias_token == canonical
+                    || slug_token == canonical
+                    || alias_token == normalized
+                    || slug_token == normalized
+            })
             .map(|p| p.as_ref())
     }
 
@@ -427,6 +436,20 @@ impl ProviderRegistry {
             .iter()
             .map(|p| format!("{} ({})", p.cli_alias(), p.name()))
             .collect()
+    }
+}
+
+fn normalize_provider_token(token: &str) -> String {
+    token.trim().to_ascii_lowercase().replace(['_', ' '], "-")
+}
+
+fn canonical_provider_token(token: &str) -> &str {
+    match token {
+        // Common human-facing shorthand users type at the CLI.
+        "claude" => "claude-code",
+        "codex-cli" => "codex",
+        "gemini-cli" => "gemini",
+        _ => token,
     }
 }
 
