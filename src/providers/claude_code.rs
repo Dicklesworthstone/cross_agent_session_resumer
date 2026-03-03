@@ -22,8 +22,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
 use crate::model::{
-    CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
-    normalize_role, parse_timestamp, reindex_messages, truncate_title,
+    CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, normalize_role,
+    parse_timestamp, reindex_messages, truncate_title,
 };
 use crate::providers::{Provider, WriteOptions, WrittenSession};
 
@@ -268,7 +268,7 @@ impl Provider for ClaudeCode {
             let content_value = entry
                 .pointer("/message/content")
                 .or_else(|| entry.get("content"));
-            let content = content_value.map(flatten_content).unwrap_or_default();
+            let content = claude_extract_text_content(content_value);
 
             // Skip empty content messages.
             if content.trim().is_empty() {
@@ -599,12 +599,50 @@ fn claude_session_id_hint(path: &Path) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let entry: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        let entry: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if let Some(session_id) = entry.get("sessionId").and_then(|v| v.as_str()) {
             return Some(session_id.to_string());
         }
     }
     None
+}
+
+fn claude_extract_text_content(content: Option<&serde_json::Value>) -> String {
+    let Some(value) = content else {
+        return String::new();
+    };
+
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let mut parts: Vec<String> = Vec::new();
+            for block in blocks {
+                match block {
+                    serde_json::Value::String(s) => parts.push(s.clone()),
+                    serde_json::Value::Object(obj) => {
+                        let block_type = obj.get("type").and_then(|v| v.as_str());
+                        if (matches!(block_type, Some("text") | Some("input_text"))
+                            || block_type.is_none())
+                            && let Some(text) = obj.get("text").and_then(|v| v.as_str())
+                        {
+                            parts.push(text.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parts.join("\n")
+        }
+        serde_json::Value::Object(obj) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -780,6 +818,7 @@ mod tests {
             r#"{"type":"user","sessionId":"s5","message":{"role":"user","content":"Read the file"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
 {"type":"assistant","sessionId":"s5","message":{"role":"assistant","content":[{"type":"text","text":"Reading it now."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"main.rs"}}],"model":"m1"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
         );
+        assert_eq!(session.messages[1].content, "Reading it now.");
         assert_eq!(session.messages[1].tool_calls.len(), 1);
         assert_eq!(session.messages[1].tool_calls[0].name, "Read");
         assert_eq!(session.messages[1].tool_calls[0].id.as_deref(), Some("t1"));

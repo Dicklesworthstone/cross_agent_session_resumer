@@ -479,14 +479,29 @@ fn cmd_list(
                     == Some(expected.as_str())
             }
             "gemini" => {
-                let _ = ws;
-                let _ = path;
-                // Gemini stores sessions under a project hash directory, but we
-                // still allow non-hash fixture layouts and legacy structures.
-                true
+                let expected_hash = casr::providers::gemini::project_hash(ws.as_path());
+                let observed_hash = path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str());
+                match observed_hash {
+                    Some(hash) if hash == expected_hash => true,
+                    Some(hash)
+                        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
+                    {
+                        false
+                    }
+                    // Keep fixture/legacy layouts permissive.
+                    _ => true,
+                }
             }
             _ => true,
         }
+    }
+
+    fn provider_has_workspace_path_hint(provider_slug: &str) -> bool {
+        matches!(provider_slug, "claude-code" | "gemini")
     }
 
     fn workspace_scoped_listed_sessions(
@@ -504,7 +519,7 @@ fn cmd_list(
                     .join("projects")
                     .join(casr::providers::claude_code::project_dir_key(ws.as_path()));
                 if !expected_dir.is_dir() {
-                    return None;
+                    return Some(vec![]);
                 }
 
                 let mut sessions: Vec<(String, PathBuf)> = Vec::new();
@@ -530,16 +545,37 @@ fn cmd_list(
                     .ok()
                     .map(PathBuf::from)
                     .or_else(|| dirs::home_dir().map(|h| h.join(".gemini")))?;
+                let tmp_root = gemini_home.join("tmp");
                 let hash = casr::providers::gemini::project_hash(ws.as_path());
-                let chats_dir = gemini_home.join("tmp").join(hash).join("chats");
+                let chats_dir = tmp_root.join(hash).join("chats");
                 if !chats_dir.is_dir() {
-                    return None;
+                    // Fallback to generic provider enumeration when tmp/ has
+                    // legacy/non-hash chat roots (fixtures or older layouts).
+                    // Otherwise, return empty early to avoid an expensive scan.
+                    let has_legacy_chat_roots =
+                        std::fs::read_dir(&tmp_root).ok().is_some_and(|entries| {
+                            entries.flatten().any(|entry| {
+                                let path = entry.path();
+                                if !path.is_dir() || !path.join("chats").is_dir() {
+                                    return false;
+                                }
+                                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                                    return true;
+                                };
+                                !(name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()))
+                            })
+                        });
+                    return if has_legacy_chat_roots {
+                        None
+                    } else {
+                        Some(vec![])
+                    };
                 }
 
                 let mut sessions: Vec<(String, PathBuf)> = Vec::new();
                 let entries = match std::fs::read_dir(&chats_dir) {
                     Ok(entries) => entries,
-                    Err(_) => return None,
+                    Err(_) => return Some(vec![]),
                 };
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -678,7 +714,11 @@ fn cmd_list(
     }
 
     if let Some(filter) = workspace_filter.as_ref() {
-        sessions.retain(|s| s.workspace.as_ref().is_some_and(|w| w.starts_with(filter)));
+        sessions.retain(|s| {
+            s.workspace.as_ref().is_some_and(|w| w.starts_with(filter))
+                || (provider_has_workspace_path_hint(&s.provider)
+                    && workspace_hint_matches(&s.provider, &s.path, Some(filter)))
+        });
     }
 
     match sort {

@@ -4,7 +4,6 @@
 # This script intentionally uses real provider homes and CLIs. It is NOT run in CI.
 # It performs conversion + resume acceptance probes for:
 #   CC <-> Codex, CC <-> Gemini, Codex <-> Gemini
-#   CC <-> Cursor, CC <-> Cline, CC <-> Aider, CC <-> Amp, CC <-> OpenCode
 #
 # Artifacts:
 #   - run.log: command transcript
@@ -21,11 +20,6 @@
 #   SMOKE_ACCEPT_CMD_CC='claude --resume {session_id}' bash scripts/real_provider_smoke.sh
 #   SMOKE_ACCEPT_CMD_COD='codex resume {session_id}' bash scripts/real_provider_smoke.sh
 #   SMOKE_ACCEPT_CMD_GMI='gemini --resume {session_id}' bash scripts/real_provider_smoke.sh
-#   SMOKE_ACCEPT_CMD_CUR='cursor .' bash scripts/real_provider_smoke.sh
-#   SMOKE_ACCEPT_CMD_CLN='code .' bash scripts/real_provider_smoke.sh
-#   SMOKE_ACCEPT_CMD_AID='aider --restore-chat-history' bash scripts/real_provider_smoke.sh
-#   SMOKE_ACCEPT_CMD_AMP='amp threads continue --execute \"Continue from @{session_id}\"' bash scripts/real_provider_smoke.sh
-#   SMOKE_ACCEPT_CMD_OPC='opencode' bash scripts/real_provider_smoke.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -228,6 +222,8 @@ source_session_for_alias() {
     local prefix="$ARTIFACTS_DIR/list_${alias}"
     local candidate_file=""
     local candidate_id=""
+    local probe_target=""
+    local -a candidate_ids=()
     local uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
     case "$alias" in
@@ -265,18 +261,61 @@ source_session_for_alias() {
     esac
 
     if [[ -n "$candidate_id" ]]; then
-        log "Resolved source session for $alias via fast path: $candidate_id ($candidate_file)"
-        echo "$candidate_id"
-        return 0
+        candidate_ids+=("$candidate_id")
     fi
 
-    # Fallback: ask casr directly, but bound runtime to avoid full-home scans hanging forever.
+    case "$alias" in
+        cc)
+            probe_target="cod"
+            ;;
+        cod|gmi)
+            probe_target="cc"
+            ;;
+        *)
+            probe_target="cc"
+            ;;
+    esac
+
+    # Also query casr list (workspace-scoped) and try candidates in recency order.
     run_cmd "$prefix" timeout 25s "$CASR" --json list --provider "$slug" --workspace "$SMOKE_WORKSPACE" --limit 25
-    if [[ "$LAST_EXIT" -ne 0 ]]; then
-        echo ""
-        return 0
+    if [[ "$LAST_EXIT" -eq 0 ]]; then
+        while IFS= read -r sid; do
+            [[ -n "$sid" ]] && candidate_ids+=("$sid")
+        done < <(jq -r '.[].session_id // empty' "$LAST_STDOUT_FILE" 2>/dev/null || true)
     fi
-    jq -r '.[0].session_id // empty' "$LAST_STDOUT_FILE"
+
+    local seen_ids="|"
+    local probe_idx=0
+    for sid in "${candidate_ids[@]}"; do
+        [[ -z "$sid" ]] && continue
+        if [[ "$seen_ids" == *"|$sid|"* ]]; then
+            continue
+        fi
+        seen_ids="${seen_ids}${sid}|"
+
+        local probe_prefix="$ARTIFACTS_DIR/validate_${alias}_${probe_idx}"
+        probe_idx=$((probe_idx + 1))
+        run_cmd "$probe_prefix" "$CASR" --json resume "$probe_target" "$sid" --source "$alias" --dry-run
+        if [[ "$LAST_EXIT" -ne 0 ]]; then
+            log "Rejected source candidate for $alias (dry-run probe failed): $sid"
+            continue
+        fi
+
+        # Sessions without workspace often cannot be resumed in target CLIs that
+        # scope by project directory (notably Claude Code). Skip these upfront.
+        if jq -e '.warnings[]? | strings | ascii_downcase | contains("no workspace")' "$LAST_STDOUT_FILE" > /dev/null 2>&1; then
+            log "Rejected source candidate for $alias (missing workspace): $sid"
+            continue
+        fi
+
+        log "Resolved source session for $alias via validated probe: $sid"
+        echo "$sid"
+        return 0
+    done
+
+    log "No valid source session candidates for $alias"
+    echo ""
+    return 0
 }
 
 configure_provider_readiness() {
@@ -316,8 +355,15 @@ expand_accept_command() {
     local alias="$1"
     local target_session="$2"
     local resume_command="$3"
+    local target_workspace="${4:-}"
     local template="${ACCEPT_TEMPLATE[$alias]}"
     if [[ -z "$template" ]]; then
+        if [[ "$alias" == "cc" && -n "$target_workspace" && -d "$target_workspace" ]]; then
+            local escaped_ws=""
+            printf -v escaped_ws '%q' "$target_workspace"
+            echo "cd $escaped_ws && $resume_command"
+            return 0
+        fi
         # Codex CLI requires a TTY; wrap with `script` when available so
         # acceptance probes exercise real resume behavior instead of failing
         # with "stdin is not a terminal".
@@ -331,6 +377,7 @@ expand_accept_command() {
 
     template="${template//\{session_id\}/$target_session}"
     template="${template//\{resume_command\}/$resume_command}"
+    template="${template//\{workspace\}/$target_workspace}"
     echo "$template"
 }
 
@@ -379,6 +426,7 @@ run_pair() {
     written_path="$(jq -r '.written_paths[0] // empty' "$LAST_STDOUT_FILE")"
     local resume_cmd
     resume_cmd="$(jq -r '.resume_command // empty' "$LAST_STDOUT_FILE")"
+    local target_workspace=""
 
     if [[ -z "$target_session" || -z "$written_path" || -z "$resume_cmd" ]]; then
         status_fail "$pair conversion output missing target session details"
@@ -386,8 +434,15 @@ run_pair() {
         return 0
     fi
 
+    if [[ "$dst" == "cc" ]]; then
+        run_cmd "$pair_dir/target_info" "$CASR" --json info "$target_session"
+        if [[ "$LAST_EXIT" -eq 0 ]]; then
+            target_workspace="$(jq -r '.workspace // empty' "$LAST_STDOUT_FILE")"
+        fi
+    fi
+
     local accept_cmd
-    accept_cmd="$(expand_accept_command "$dst" "$target_session" "$resume_cmd")"
+    accept_cmd="$(expand_accept_command "$dst" "$target_session" "$resume_cmd" "$target_workspace")"
 
     run_accept_cmd "$pair_dir/accept" "$accept_cmd"
     local accept_exit="$LAST_EXIT"
