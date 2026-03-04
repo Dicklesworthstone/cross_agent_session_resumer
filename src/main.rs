@@ -799,8 +799,11 @@ fn cmd_list(
             0.0
         };
 
-        let fallback_tool_uses = tool_uses_from_source_file(provider_slug, path);
-        let tool_uses = canonical_tool_uses.max(fallback_tool_uses);
+        let tool_uses = if canonical_tool_uses > 0 {
+            canonical_tool_uses
+        } else {
+            tool_uses_from_source_file(provider_slug, path)
+        };
 
         (
             file_size_bytes,
