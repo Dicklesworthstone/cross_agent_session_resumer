@@ -48,6 +48,8 @@ impl SourceHint {
                 dirs::home_dir()
                     .map(|h| h.join(rest))
                     .unwrap_or_else(|| PathBuf::from(value))
+            } else if value == "~" {
+                dirs::home_dir().unwrap_or_else(|| PathBuf::from(value))
             } else {
                 PathBuf::from(value)
             };
@@ -473,12 +475,17 @@ impl ProviderRegistry {
             "jsonl" => {
                 let file = std::fs::File::open(path).ok()?;
                 let reader = std::io::BufReader::new(file);
+                let mut lines_checked = 0;
                 for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+                    let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(trimmed) else {
+                        continue;
+                    };
+                    lines_checked += 1;
+
                     if value.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
                         return self.find_by_slug("codex");
                     }
@@ -522,7 +529,10 @@ impl ProviderRegistry {
                     {
                         return self.find_by_slug("clawdbot");
                     }
-                    break;
+
+                    if lines_checked >= 50 {
+                        break;
+                    }
                 }
             }
             "json" => {

@@ -214,10 +214,10 @@ mod cc_parity {
         );
         assert_eq!(s.model_name.as_deref(), Some("claude-sonnet-4-5-20250929"));
 
-        // CASS parity: tool_result-only user messages produce empty content
-        // after flatten_content and are skipped. File-history-snapshot is also
-        // skipped. Original 7 lines → 4 canonical messages.
-        assert_eq!(s.messages.len(), 4);
+        // CASR divergence: tool_result-only user messages are preserved
+        // so they can be resumed. File-history-snapshot is skipped.
+        // Original 7 lines → 6 canonical messages.
+        assert_eq!(s.messages.len(), 6);
 
         // msg[0]: user text request.
         assert_eq!(s.messages[0].role, MessageRole::User);
@@ -236,17 +236,26 @@ mod cc_parity {
             Some("tool-read-1")
         );
 
-        // msg[2]: assistant with Edit tool_use (second assistant after
-        // tool_result-only user was skipped).
-        assert_eq!(s.messages[2].role, MessageRole::Assistant);
-        assert!(s.messages[2].content.contains("convert this to async"));
-        assert_eq!(s.messages[2].tool_calls.len(), 1);
-        assert_eq!(s.messages[2].tool_calls[0].name, "Edit");
+        // msg[2]: user with tool_result.
+        assert_eq!(s.messages[2].role, MessageRole::User);
+        assert_eq!(s.messages[2].tool_results.len(), 1);
+        assert_eq!(s.messages[2].tool_results[0].call_id.as_deref(), Some("tool-read-1"));
 
-        // msg[3]: final assistant text.
+        // msg[3]: assistant with Edit tool_use.
         assert_eq!(s.messages[3].role, MessageRole::Assistant);
-        assert!(s.messages[3].content.contains("handler is now async"));
-        assert!(s.messages[3].tool_calls.is_empty());
+        assert!(s.messages[3].content.contains("convert this to async"));
+        assert_eq!(s.messages[3].tool_calls.len(), 1);
+        assert_eq!(s.messages[3].tool_calls[0].name, "Edit");
+
+        // msg[4]: user with tool_result.
+        assert_eq!(s.messages[4].role, MessageRole::User);
+        assert_eq!(s.messages[4].tool_results.len(), 1);
+        assert_eq!(s.messages[4].tool_results[0].call_id.as_deref(), Some("tool-edit-1"));
+
+        // msg[5]: final assistant text.
+        assert_eq!(s.messages[5].role, MessageRole::Assistant);
+        assert!(s.messages[5].content.contains("handler is now async"));
+        assert!(s.messages[5].tool_calls.is_empty());
 
         // Verify sequential idx after filtering.
         for (i, msg) in s.messages.iter().enumerate() {
@@ -1257,9 +1266,11 @@ mod cross_provider_parity {
         for (name, loader) in &fixtures {
             let s = loader();
             for msg in &s.messages {
+                let has_content = !msg.content.trim().is_empty();
+                let has_tools = !msg.tool_calls.is_empty() || !msg.tool_results.is_empty();
                 assert!(
-                    !msg.content.trim().is_empty(),
-                    "[{name}] msg[{}] should not have empty content",
+                    has_content || has_tools,
+                    "[{name}] msg[{}] should not have completely empty content (needs text or tools)",
                     msg.idx
                 );
             }
