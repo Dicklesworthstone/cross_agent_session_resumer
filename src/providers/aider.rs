@@ -409,22 +409,24 @@ impl Provider for Aider {
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         for history_file in Self::find_history_files() {
-            let content = match std::fs::read_to_string(&history_file) {
-                Ok(c) => c,
+            let file = match std::fs::File::open(&history_file) {
+                Ok(f) => f,
                 Err(_) => continue,
             };
-
-            for session in Self::split_sessions(&content) {
-                if session.session_id == session_id {
-                    let virtual_path =
-                        Self::virtual_session_path(&history_file, &session.session_id);
-                    debug!(
-                        history_file = %history_file.display(),
-                        session_path = %virtual_path.display(),
-                        session_id,
-                        "found Aider session"
-                    );
-                    return Some(virtual_path);
+            let reader = std::io::BufReader::new(file);
+            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+                if let Some(ts) = parse_session_header(&line) {
+                    let id = timestamp_to_session_id(&ts);
+                    if id == session_id {
+                        let virtual_path = Self::virtual_session_path(&history_file, session_id);
+                        debug!(
+                            history_file = %history_file.display(),
+                            session_path = %virtual_path.display(),
+                            session_id,
+                            "found Aider session"
+                        );
+                        return Some(virtual_path);
+                    }
                 }
             }
         }
@@ -479,7 +481,7 @@ impl Provider for Aider {
     fn write_session(
         &self,
         session: &CanonicalSession,
-        opts: &WriteOptions,
+        _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let target_session_id = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
         let now = chrono::Utc::now();
@@ -504,6 +506,17 @@ impl Provider for Aider {
 
         // Build the Aider Markdown content.
         let mut output = String::new();
+
+        // If the file exists, preserve its contents.
+        if target_path.exists()
+            && let Ok(existing_content) = std::fs::read_to_string(&target_path)
+        {
+            output.push_str(&existing_content);
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+
         output.push_str(&format!("\n# aider chat started at {now_str}\n\n"));
 
         // Add model info as tool output if available.
@@ -536,8 +549,10 @@ impl Provider for Aider {
 
         let content_bytes = output.into_bytes();
 
+        // Always force the write because Aider appends to a shared history file.
+        // A pre-existing file is the expected state, not a conflict.
         let outcome =
-            crate::pipeline::atomic_write(&target_path, &content_bytes, opts.force, self.slug())?;
+            crate::pipeline::atomic_write(&target_path, &content_bytes, true, self.slug())?;
 
         info!(
             target_session_id,
@@ -568,13 +583,16 @@ impl Provider for Aider {
 
         let mut results = Vec::new();
         for history_file in &history_files {
-            let Ok(content) = std::fs::read_to_string(history_file) else {
+            let Ok(file) = std::fs::File::open(history_file) else {
                 continue;
             };
-
-            for session in Self::split_sessions(&content) {
-                let virtual_path = Self::virtual_session_path(history_file, &session.session_id);
-                results.push((session.session_id, virtual_path));
+            let reader = std::io::BufReader::new(file);
+            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+                if let Some(ts) = parse_session_header(&line) {
+                    let id = timestamp_to_session_id(&ts);
+                    let virtual_path = Self::virtual_session_path(history_file, &id);
+                    results.push((id, virtual_path));
+                }
             }
         }
 
@@ -651,14 +669,13 @@ fn extract_workspace_from_tool_line(line: &str) -> Option<PathBuf> {
                 .chars()
                 .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
                 .collect();
-            if path.len() > prefix.len() + 2 {
+            if path.len() > prefix.len() {
                 return Some(PathBuf::from(path));
             }
         }
     }
     None
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
