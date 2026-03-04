@@ -429,6 +429,12 @@ impl Provider for PiAgent {
 
         // Messages.
         for msg in &session.messages {
+            // Skip messages with empty content to match read_session filtering,
+            // preventing message count mismatch on round-trip.
+            if msg.content.trim().is_empty() && msg.tool_calls.is_empty() {
+                continue;
+            }
+
             let role_str = match &msg.role {
                 MessageRole::User => "user",
                 MessageRole::Assistant => "assistant",
@@ -462,6 +468,19 @@ impl Provider for PiAgent {
             if let Some(ref author) = msg.author {
                 inner["model"] = serde_json::Value::String(author.clone());
             }
+
+            // Add usage field with proper structure to prevent TypeError in Pi
+            // when accessing usage.input.
+            let usage = if let Some(usage_val) = msg.extra.get("usage") {
+                usage_val.clone()
+            } else {
+                serde_json::json!({
+                    "input": 0,
+                    "output": 0,
+                    "total": 0
+                })
+            };
+            inner["usage"] = usage;
 
             let ts_str = msg
                 .timestamp

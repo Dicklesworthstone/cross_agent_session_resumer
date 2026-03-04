@@ -245,8 +245,7 @@ impl Provider for Codex {
     ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
-        let now_epoch: f64 =
-            now.timestamp() as f64 + f64::from(now.timestamp_subsec_millis()) / 1000.0;
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         let sessions_dir = Self::sessions_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine Codex sessions directory"))?;
@@ -270,21 +269,26 @@ impl Provider for Codex {
 
         lines.push(serde_json::to_string(&serde_json::json!({
             "type": "session_meta",
-            "timestamp": now_epoch,
+            "timestamp": now_iso,
             "payload": {
                 "id": target_session_id,
                 "cwd": cwd,
+                "originator": "casr",
+                "cli_version": env!("CARGO_PKG_VERSION"),
+                "source": "cli",
+                "model_provider": "openai",
             }
         }))?);
 
         // 2. Messages.
         for msg in &session.messages {
-            let msg_ts: f64 = msg
+            let msg_ts = msg
                 .timestamp
-                .map(|ts| ts as f64 / 1000.0)
-                .unwrap_or(now_epoch);
+                .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts))
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                .unwrap_or_else(|| now_iso.clone());
 
-            for event in codex_events_for_message(msg, msg_ts) {
+            for event in codex_events_for_message(msg, &msg_ts) {
                 lines.push(serde_json::to_string(&event)?);
             }
         }
@@ -314,7 +318,7 @@ impl Provider for Codex {
     }
 }
 
-fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: f64) -> Vec<serde_json::Value> {
+fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: &str) -> Vec<serde_json::Value> {
     // User messages that carry tool payloads must be serialized as response_item
     // envelopes; event_msg/user_message cannot represent tool_use/tool_result blocks.
     let user_needs_response_item = msg.role == MessageRole::User
@@ -333,6 +337,7 @@ fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: f64) -> Vec<serde_js
             "type": "response_item",
             "timestamp": msg_ts,
             "payload": {
+                "type": "message",
                 "role": codex_role_string(&msg.role),
                 "content": codex_response_content(msg),
             }
@@ -355,6 +360,7 @@ fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: f64) -> Vec<serde_js
                 "type": "response_item",
                 "timestamp": msg_ts,
                 "payload": {
+                    "type": "message",
                     "role": codex_role_string(&msg.role),
                     "content": codex_response_content(msg),
                 }
@@ -381,7 +387,7 @@ fn codex_role_string(role: &MessageRole) -> String {
         MessageRole::User => "user".to_string(),
         MessageRole::Assistant => "assistant".to_string(),
         MessageRole::Tool => "tool".to_string(),
-        MessageRole::System => "system".to_string(),
+        MessageRole::System => "developer".to_string(),
         MessageRole::Other(other) => other.clone(),
     }
 }
@@ -1072,9 +1078,10 @@ mod tests {
             }),
         };
 
-        let events = codex_events_for_message(&msg, 1_700_000_000.0);
+        let events = codex_events_for_message(&msg, "2023-11-14T22:13:20.000Z");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["type"], "response_item");
+        assert_eq!(events[0]["payload"]["type"], "message");
         let content_blocks = events[0]["payload"]["content"]
             .as_array()
             .expect("response_item content should be array");
@@ -1109,9 +1116,10 @@ mod tests {
             extra: json!({}),
         };
 
-        let events = codex_events_for_message(&msg, 1_700_000_000.0);
+        let events = codex_events_for_message(&msg, "2023-11-14T22:13:20.000Z");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "response_item");
+        assert_eq!(events[0]["payload"]["type"], "message");
         assert_eq!(events[0]["payload"]["role"], "user");
         let blocks = events[0]["payload"]["content"]
             .as_array()
@@ -1425,7 +1433,7 @@ not json
             tool_results: vec![],
             extra: json!({}),
         };
-        let events = codex_events_for_message(&msg, 1_700_000_000.0);
+        let events = codex_events_for_message(&msg, "2023-11-14T22:13:20.000Z");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "event_msg");
         assert_eq!(events[0]["payload"]["type"], "user_message");
@@ -1444,7 +1452,7 @@ not json
             tool_results: vec![],
             extra: json!({}),
         };
-        let events = codex_events_for_message(&msg, 1_700_000_000.0);
+        let events = codex_events_for_message(&msg, "2023-11-14T22:13:20.000Z");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "event_msg");
         assert_eq!(events[0]["payload"]["type"], "agent_reasoning");
@@ -1456,7 +1464,7 @@ not json
         assert_eq!(codex_role_string(&MessageRole::User), "user");
         assert_eq!(codex_role_string(&MessageRole::Assistant), "assistant");
         assert_eq!(codex_role_string(&MessageRole::Tool), "tool");
-        assert_eq!(codex_role_string(&MessageRole::System), "system");
+        assert_eq!(codex_role_string(&MessageRole::System), "developer");
         assert_eq!(
             codex_role_string(&MessageRole::Other("custom".to_string())),
             "custom"
@@ -1475,7 +1483,7 @@ not json
             tool_results: vec![],
             extra: json!(null),
         };
-        let events = codex_events_for_message(&msg, 1_700_000_000.0);
+        let events = codex_events_for_message(&msg, "2023-11-14T22:13:20.000Z");
         assert_eq!(
             events.len(),
             1,

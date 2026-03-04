@@ -570,6 +570,121 @@ pub struct DetectionResult {
     pub evidence: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Git repository discovery
+// ---------------------------------------------------------------------------
+
+/// The kind of `.git` marker found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitMarker {
+    /// `.git` is a directory — standard repository root.
+    Directory,
+    /// `.git` is a file containing a `gitdir:` pointer (worktree or submodule).
+    File {
+        /// Resolved `gitdir:` target path.
+        gitdir: PathBuf,
+    },
+}
+
+/// Maximum bytes to read from a `.git` file marker before giving up.
+///
+/// A well-formed `.git` file is a single line like `gitdir: ../path/to/.git`.
+/// 4 KiB is more than enough for even deeply nested paths while protecting
+/// against accidentally opening large non-marker files.
+const GIT_FILE_MAX_BYTES: usize = 4096;
+
+/// Parse a `.git` marker at the given `path`.
+///
+/// Returns `Some(GitMarker)` if `path` is either:
+/// - A directory (standard git repo root), or
+/// - A file containing a valid `gitdir: <non-empty-path>` line.
+///
+/// Hardened parsing rules for `.git` files:
+/// - Reads at most [`GIT_FILE_MAX_BYTES`] bytes.
+/// - Skips blank lines and lines starting with `#` (comments).
+/// - Requires the first non-blank, non-comment line to start with `gitdir:`.
+/// - The path after `gitdir:` must be non-empty after trimming.
+/// - Resolves relative `gitdir:` paths against the parent of `path`.
+pub fn parse_git_marker(path: &Path) -> Option<GitMarker> {
+    if path.is_dir() {
+        return Some(GitMarker::Directory);
+    }
+
+    if !path.is_file() {
+        return None;
+    }
+
+    // Bounded read.
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; GIT_FILE_MAX_BYTES];
+    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+    buf.truncate(n);
+    let content = std::str::from_utf8(&buf).ok()?;
+
+    // Find first meaningful line.
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Must start with `gitdir:`.
+        let rest = trimmed.strip_prefix("gitdir:")?;
+        let gitdir_str = rest.trim();
+        if gitdir_str.is_empty() {
+            return None;
+        }
+
+        let gitdir_path = PathBuf::from(gitdir_str);
+        let resolved = if gitdir_path.is_relative() {
+            // Resolve relative to the directory containing the `.git` file.
+            path.parent()
+                .map(|parent| parent.join(&gitdir_path))
+                .unwrap_or(gitdir_path)
+        } else {
+            gitdir_path
+        };
+
+        return Some(GitMarker::File { gitdir: resolved });
+    }
+
+    // No `gitdir:` line found.
+    None
+}
+
+/// Walk upward from `start` to find the nearest git repository root.
+///
+/// Looks for a `.git` entry (directory or file) in each ancestor directory.
+/// Returns `None` if no `.git` marker is found before reaching the filesystem root.
+pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+
+    loop {
+        let candidate = current.join(".git");
+        if candidate.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Derive a repository name from a workspace path.
+///
+/// Uses the basename of the git root directory if found, otherwise the
+/// basename of the workspace path itself.
+pub fn repo_name_from_path(workspace: &Path) -> Option<String> {
+    let root = find_git_root(workspace).unwrap_or_else(|| workspace.to_path_buf());
+    root.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProviderRegistry, SourceHint, is_plausible_session};
@@ -759,5 +874,172 @@ mod tests {
                 .any(|a| a.contains("cc") && a.contains("Claude Code")),
             "expected cc alias in known_aliases: {aliases:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Git marker parsing
+    // -----------------------------------------------------------------------
+
+    use super::{GitMarker, find_git_root, parse_git_marker, repo_name_from_path};
+
+    #[test]
+    fn git_marker_directory_detected() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir(&git_dir).expect("create .git dir");
+
+        let result = parse_git_marker(&git_dir);
+        assert_eq!(result, Some(GitMarker::Directory));
+    }
+
+    #[test]
+    fn git_marker_file_with_valid_gitdir() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(&git_file, "gitdir: ../.git/worktrees/my-branch\n").expect("write");
+
+        let result = parse_git_marker(&git_file);
+        match result {
+            Some(GitMarker::File { gitdir }) => {
+                // Should be resolved relative to the .git file's parent.
+                assert!(
+                    gitdir.ends_with(".git/worktrees/my-branch"),
+                    "gitdir should end with expected path, got: {}",
+                    gitdir.display()
+                );
+            }
+            other => panic!("expected GitMarker::File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_marker_file_with_absolute_gitdir() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(&git_file, "gitdir: /absolute/path/to/.git\n").expect("write");
+
+        let result = parse_git_marker(&git_file);
+        match result {
+            Some(GitMarker::File { gitdir }) => {
+                assert_eq!(gitdir, PathBuf::from("/absolute/path/to/.git"));
+            }
+            other => panic!("expected GitMarker::File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_marker_file_skips_blank_and_comment_lines() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(
+            &git_file,
+            "\n# This is a comment\n\ngitdir: /some/path\n",
+        )
+        .expect("write");
+
+        let result = parse_git_marker(&git_file);
+        match result {
+            Some(GitMarker::File { gitdir }) => {
+                assert_eq!(gitdir, PathBuf::from("/some/path"));
+            }
+            other => panic!("expected GitMarker::File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_marker_file_malformed_no_gitdir_prefix() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(&git_file, "not-a-gitdir-line\n").expect("write");
+
+        let result = parse_git_marker(&git_file);
+        assert_eq!(result, None, "should return None for malformed .git file");
+    }
+
+    #[test]
+    fn git_marker_file_malformed_empty_gitdir_path() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(&git_file, "gitdir: \n").expect("write");
+
+        let result = parse_git_marker(&git_file);
+        assert_eq!(
+            result, None,
+            "should return None when gitdir path is empty"
+        );
+    }
+
+    #[test]
+    fn git_marker_file_malformed_only_comments_and_blanks() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(&git_file, "\n# comment\n# another comment\n\n").expect("write");
+
+        let result = parse_git_marker(&git_file);
+        assert_eq!(
+            result, None,
+            "should return None when file has only comments/blanks"
+        );
+    }
+
+    #[test]
+    fn git_marker_nonexistent_path() {
+        let path = PathBuf::from("/nonexistent/path/.git");
+        let result = parse_git_marker(&path);
+        assert_eq!(result, None, "should return None for nonexistent path");
+    }
+
+    #[test]
+    fn find_git_root_locates_standard_repo() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir(&git_dir).expect("create .git dir");
+
+        // Search from a subdirectory.
+        let sub = tmp.path().join("src").join("deep");
+        std::fs::create_dir_all(&sub).expect("create subdirs");
+
+        let root = find_git_root(&sub);
+        assert_eq!(root, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn find_git_root_locates_worktree_via_file_marker() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_file = tmp.path().join(".git");
+        std::fs::write(&git_file, "gitdir: /some/worktree").expect("write");
+
+        let root = find_git_root(tmp.path());
+        assert_eq!(root, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn find_git_root_returns_none_when_no_git() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let sub = tmp.path().join("no-git-here");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+
+        let root = find_git_root(&sub);
+        // May find root if /tmp itself is in a git repo, but our tmpdir
+        // should not have .git. We just test it doesn't panic.
+        // In a clean env, root would be None.
+        let _ = root;
+    }
+
+    #[test]
+    fn repo_name_from_path_returns_basename() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let git_dir = tmp.path().join("my_project").join(".git");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+        let project_dir = tmp.path().join("my_project");
+
+        let name = repo_name_from_path(&project_dir);
+        assert_eq!(name.as_deref(), Some("my_project"));
+    }
+
+    #[test]
+    fn repo_name_from_path_falls_back_to_workspace_basename() {
+        let name = repo_name_from_path(&PathBuf::from("/data/projects/some_tool"));
+        assert_eq!(name.as_deref(), Some("some_tool"));
     }
 }

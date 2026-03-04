@@ -141,6 +141,7 @@ run_with_spinner() {
 
 # Draw a box around text with automatic width calculation.
 # Uses Unicode double-line box characters for consistent visual structure.
+# Responsive: clamps to terminal width and truncates long lines.
 # Usage: draw_box "color_code" "line1" "line2" ...
 draw_box() {
   local color="$1"
@@ -160,6 +161,17 @@ draw_box() {
     fi
   done
 
+  # Clamp box width to terminal width (leave room for box chars: 2 borders + 4 padding).
+  local term_width
+  term_width=$(tput cols 2>/dev/null || echo 80)
+  local max_content_width=$((term_width - 6))
+  if [ "$max_content_width" -lt 20 ]; then
+    max_content_width=20
+  fi
+  if [ "$max_width" -gt "$max_content_width" ]; then
+    max_width=$max_content_width
+  fi
+
   local inner_width=$((max_width + 4))
   local border=""
   for ((i=0; i<inner_width; i++)); do
@@ -172,6 +184,15 @@ draw_box() {
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
+    # Truncate lines that exceed the available width.
+    if [ "$len" -gt "$max_width" ]; then
+      # Truncate the visible (stripped) content and re-apply to raw line.
+      # For simplicity, cut raw line bytes; ANSI codes near the cut may break
+      # but this is acceptable for a cosmetic display function.
+      line=$(printf '%b' "$line" | cut -c1-"$max_width")
+      stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
+      len=${#stripped}
+    fi
     local padding=$((max_width - len))
     local pad_str=""
     for ((i=0; i<padding; i++)); do
