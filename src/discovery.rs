@@ -481,7 +481,8 @@ impl ProviderRegistry {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(trimmed) else {
+                    let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(trimmed)
+                    else {
                         continue;
                     };
                     lines_checked += 1;
@@ -536,8 +537,9 @@ impl ProviderRegistry {
                 }
             }
             "json" => {
-                let content = std::fs::read_to_string(path).ok()?;
-                let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+                let file = std::fs::File::open(path).ok()?;
+                let reader = std::io::BufReader::new(file);
+                let value: serde_json::Value = serde_json::from_reader(reader).ok()?;
 
                 if value.get("sessionId").is_some() && value.get("messages").is_some() {
                     return self.find_by_slug("gemini");

@@ -186,17 +186,21 @@ impl Provider for ChatGpt {
                 }
 
                 // Deeper check: parse JSON and look for matching "id" or "conversation_id".
-                if let Ok(content) = std::fs::read_to_string(path)
-                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-                {
-                    let conv_id = val
-                        .get("id")
-                        .or_else(|| val.get("conversation_id"))
-                        .and_then(|v| v.as_str());
-                    if let Some(cid) = conv_id
-                        && cid.eq_ignore_ascii_case(&id_lower)
-                    {
-                        return Some(path.to_path_buf());
+                // Use a minimal struct to avoid allocating the massive `mapping` objects in memory.
+                #[derive(serde::Deserialize)]
+                struct ChatGptHeader {
+                    id: Option<String>,
+                    conversation_id: Option<String>,
+                }
+                if let Ok(file) = std::fs::File::open(path) {
+                    let reader = std::io::BufReader::new(file);
+                    if let Ok(header) = serde_json::from_reader::<_, ChatGptHeader>(reader) {
+                        let conv_id = header.id.as_deref().or(header.conversation_id.as_deref());
+                        if let Some(cid) = conv_id
+                            && cid.eq_ignore_ascii_case(&id_lower)
+                        {
+                            return Some(path.to_path_buf());
+                        }
                     }
                 }
             }
@@ -207,9 +211,10 @@ impl Provider for ChatGpt {
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading ChatGPT session");
 
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let root: serde_json::Value = serde_json::from_str(&content)
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = std::io::BufReader::new(file);
+        let root: serde_json::Value = serde_json::from_reader(reader)
             .with_context(|| format!("failed to parse JSON {}", path.display()))?;
 
         // Session ID: prefer "id", then "conversation_id", then filename stem.

@@ -224,9 +224,10 @@ impl Provider for Gemini {
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading Gemini session");
 
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let root: serde_json::Value = serde_json::from_str(&content)
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = std::io::BufReader::new(file);
+        let root: serde_json::Value = serde_json::from_reader(reader)
             .with_context(|| format!("failed to parse JSON {}", path.display()))?;
 
         // Session-level fields.
@@ -840,11 +841,15 @@ fn normalize_workspace_candidate(raw: &str) -> Option<PathBuf> {
 }
 
 fn session_id_from_file(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("sessionId")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
+    #[derive(serde::Deserialize)]
+    struct GeminiHeader {
+        #[serde(rename = "sessionId")]
+        session_id: Option<String>,
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let header: GeminiHeader = serde_json::from_reader(reader).ok()?;
+    header.session_id
 }
 
 #[cfg(test)]

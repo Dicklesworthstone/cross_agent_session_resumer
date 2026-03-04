@@ -120,9 +120,10 @@ impl Amp {
     }
 
     fn read_json(path: &Path) -> anyhow::Result<serde_json::Value> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&content).with_context(|| format!("invalid json: {}", path.display()))
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = std::io::BufReader::new(file);
+        serde_json::from_reader(reader).with_context(|| format!("invalid json: {}", path.display()))
     }
 
     fn file_uri_to_path(s: &str) -> Option<PathBuf> {
