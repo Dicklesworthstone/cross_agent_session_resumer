@@ -51,7 +51,7 @@ impl Factory {
     /// e.g., `-Users-alice-Dev-myproject` → `/Users/alice/Dev/myproject`
     fn decode_workspace_slug(slug: &str) -> Option<PathBuf> {
         if slug.starts_with('-') {
-            let path_str = slug.replacen('-', "/", 1).replace('-', "/");
+            let path_str = slug.replace('-', "/");
             Some(PathBuf::from(path_str))
         } else {
             None
