@@ -273,6 +273,7 @@ impl Provider for Codex {
             "payload": {
                 "id": target_session_id,
                 "cwd": cwd,
+                "timestamp": now_iso,
                 "originator": "casr",
                 "cli_version": env!("CARGO_PKG_VERSION"),
                 "source": "cli",
@@ -395,9 +396,17 @@ fn codex_role_string(role: &MessageRole) -> String {
 fn codex_response_content(msg: &CanonicalMessage) -> serde_json::Value {
     let mut blocks: Vec<serde_json::Value> = Vec::new();
 
+    // Codex expects "output_text" for assistant-generated content blocks,
+    // "input_text" for user-supplied content blocks.
+    let text_type = if msg.role == MessageRole::Assistant {
+        "output_text"
+    } else {
+        "input_text"
+    };
+
     if !msg.content.is_empty() {
         blocks.push(serde_json::json!({
-            "type": "input_text",
+            "type": text_type,
             "text": msg.content,
         }));
     }
@@ -423,7 +432,7 @@ fn codex_response_content(msg: &CanonicalMessage) -> serde_json::Value {
     // Avoid empty response payloads in provider-native output.
     if blocks.is_empty() {
         blocks.push(serde_json::json!({
-            "type": "input_text",
+            "type": text_type,
             "text": msg.content,
         }));
     }
