@@ -1862,8 +1862,8 @@ fn writer_piagent_roundtrip() {
         "PiAgent output file should exist"
     );
     assert!(
-        written.resume_command.contains("pi-agent"),
-        "PiAgent resume command should reference pi-agent"
+        written.resume_command.contains("pi --session"),
+        "PiAgent resume command should reference pi --session"
     );
 
     let readback = PiAgent
