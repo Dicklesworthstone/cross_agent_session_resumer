@@ -1620,6 +1620,75 @@ fn roundtrip_codex_to_piagent() {
     assert_new_session_id(&readback, "Cod→PiAgent");
 }
 
+/// Regression test for issue #9: Codex sessions with `originator: codex_exec`
+/// produce tool-result-only messages (empty content, non-empty tool_results).
+/// The Pi writer synthesises readable content for these, but without pre-write
+/// normalisation the read-back verification sees a content mismatch
+/// ("wrote 0 bytes, read back 43 bytes").
+///
+/// This test applies the same normalisation the pipeline does (materialising
+/// tool-result text into `content`) before writing, then asserts roundtrip
+/// fidelity including the synthesised content.
+#[test]
+fn roundtrip_codex_exec_tool_results_to_piagent() {
+    let _lock = PIAGENT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("PI_AGENT_HOME", tmp.path());
+
+    let mut session = read_codex_fixture("codex_exec_tool_results", "jsonl");
+
+    // Verify the fixture actually has at least one tool-result-only message
+    // with empty content (this is the scenario that triggers the bug).
+    let has_tool_result_only = session.messages.iter().any(|m| {
+        m.content.trim().is_empty()
+            && m.tool_calls.is_empty()
+            && !m.tool_results.is_empty()
+    });
+    assert!(
+        has_tool_result_only,
+        "fixture should contain at least one tool-result-only message with empty content"
+    );
+
+    // Apply the same normalisation the pipeline does before writing.
+    // This mirrors the "7b. Normalize tool-only messages" step in
+    // ConversionPipeline::convert().
+    for msg in &mut session.messages {
+        if !msg.content.trim().is_empty() {
+            continue;
+        }
+        let has_tool_calls = !msg.tool_calls.is_empty();
+        let has_tool_results = !msg.tool_results.is_empty();
+        if !has_tool_calls && !has_tool_results {
+            continue;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for tc in &msg.tool_calls {
+            parts.push(format!("[Tool: {}]", tc.name));
+        }
+        for tr in &msg.tool_results {
+            if tr.is_error {
+                parts.push(format!("[Tool Error] {}", tr.content));
+            } else {
+                parts.push(format!("[Tool Output] {}", tr.content));
+            }
+        }
+        if !parts.is_empty() {
+            msg.content = parts.join("\n");
+        }
+    }
+
+    let written = PiAgent
+        .write_session(&session, &WriteOptions { force: false })
+        .expect("CodExec→PiAgent: write should succeed");
+
+    let readback = PiAgent
+        .read_session(&written.paths[0])
+        .expect("CodExec→PiAgent: read-back should succeed");
+
+    assert_roundtrip_fidelity(&session, &readback, "CodExec→PiAgent");
+    assert_new_session_id(&readback, "CodExec→PiAgent");
+}
+
 // ===========================================================================
 // Gemini → all non-CC/Codex targets (11 pairs)
 // ===========================================================================

@@ -397,6 +397,51 @@ but resume may fail until the CLI is installed.",
             });
         }
 
+        // 7b. Normalize tool-only messages with empty content.
+        //
+        // Some source formats (notably Codex with `originator: codex_exec`)
+        // produce canonical messages that have empty `content` but non-empty
+        // `tool_calls` and/or `tool_results`.  Target writers (e.g. Pi-Agent)
+        // either synthesize readable content from tool metadata or emit
+        // toolCall blocks that the reader flattens into text on read-back.
+        // Unless we mirror that synthesis here the read-back verification
+        // will see a content mismatch ("wrote 0 bytes, read back N bytes").
+        //
+        // Fix: materialise the tool-call/result text into `content` on the
+        // canonical message itself so that write ↔ readback is consistent.
+        for msg in &mut canonical.messages {
+            if !msg.content.trim().is_empty() {
+                continue;
+            }
+
+            let has_tool_calls = !msg.tool_calls.is_empty();
+            let has_tool_results = !msg.tool_results.is_empty();
+
+            if !has_tool_calls && !has_tool_results {
+                continue;
+            }
+
+            let mut parts: Vec<String> = Vec::new();
+
+            // Synthesize text for tool calls (matches Pi reader's format).
+            for tc in &msg.tool_calls {
+                parts.push(format!("[Tool: {}]", tc.name));
+            }
+
+            // Synthesize text for tool results.
+            for tr in &msg.tool_results {
+                if tr.is_error {
+                    parts.push(format!("[Tool Error] {}", tr.content));
+                } else {
+                    parts.push(format!("[Tool Output] {}", tr.content));
+                }
+            }
+
+            if !parts.is_empty() {
+                msg.content = parts.join("\n");
+            }
+        }
+
         // 8. Write to target provider.
         let write_opts = WriteOptions { force: opts.force };
         let written = target_provider.write_session(&canonical, &write_opts)?;

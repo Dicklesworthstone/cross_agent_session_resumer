@@ -472,17 +472,19 @@ impl Provider for PiAgent {
 
             // Build content: always an array of typed blocks so Pi's JS
             // `message.content.some(...)` never receives a plain string.
-            let mut blocks = vec![serde_json::json!({
+            //
+            // We intentionally emit only a text block here — no toolCall
+            // blocks.  Pi's reader (`flatten_content`) extracts text from
+            // both "text" AND "toolCall" blocks, so emitting both would
+            // cause the read-back content to double up (e.g. "[Tool: shell]"
+            // appearing in both the text block and the toolCall block).
+            // Since the pipeline already normalises tool-call / tool-result
+            // info into `effective_content`, a single text block is both
+            // sufficient and round-trip-safe.
+            let blocks = vec![serde_json::json!({
                 "type": "text",
                 "text": effective_content,
             })];
-            for tc in &msg.tool_calls {
-                blocks.push(serde_json::json!({
-                    "type": "toolCall",
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                }));
-            }
             let content = serde_json::Value::Array(blocks);
 
             let mut inner = serde_json::json!({
