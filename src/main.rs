@@ -329,20 +329,12 @@ fn cmd_resume(
             source_provider: result.source_provider.clone(),
             target_provider: result.target_provider.clone(),
             source_session_id: result.canonical_session.session_id.clone(),
-            target_session_id: result
+            target_session_id: result.written.as_ref().map(|w| w.session_id.clone()),
+            written_paths: result
                 .written
                 .as_ref()
-                .map(|w| w.session_id.clone()),
-            written_paths: result.written.as_ref().map(|w| {
-                w.paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect()
-            }),
-            resume_command: result
-                .written
-                .as_ref()
-                .map(|w| w.resume_command.clone()),
+                .map(|w| w.paths.iter().map(|p| p.display().to_string()).collect()),
+            resume_command: result.written.as_ref().map(|w| w.resume_command.clone()),
             dry_run: result.written.is_none(),
             warnings: result.warnings.clone(),
         };

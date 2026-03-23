@@ -931,11 +931,7 @@ mod tests {
     fn git_marker_file_skips_blank_and_comment_lines() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let git_file = tmp.path().join(".git");
-        std::fs::write(
-            &git_file,
-            "\n# This is a comment\n\ngitdir: /some/path\n",
-        )
-        .expect("write");
+        std::fs::write(&git_file, "\n# This is a comment\n\ngitdir: /some/path\n").expect("write");
 
         let result = parse_git_marker(&git_file);
         match result {
@@ -963,10 +959,7 @@ mod tests {
         std::fs::write(&git_file, "gitdir: \n").expect("write");
 
         let result = parse_git_marker(&git_file);
-        assert_eq!(
-            result, None,
-            "should return None when gitdir path is empty"
-        );
+        assert_eq!(result, None, "should return None when gitdir path is empty");
     }
 
     #[test]

@@ -300,7 +300,10 @@ fn cli_list_json_is_valid_array() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("list --json should emit valid JSON");
-    assert!(parsed.is_object(), "list --json should be an envelope object");
+    assert!(
+        parsed.is_object(),
+        "list --json should be an envelope object"
+    );
     assert_eq!(parsed["schema_version"], 2);
     let items = parsed["items"].as_array().expect("items should be array");
     assert!(!items.is_empty());

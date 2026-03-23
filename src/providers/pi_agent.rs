@@ -434,8 +434,7 @@ impl Provider for PiAgent {
             // we must ensure every written message survives the round-trip.
             // Tool-result-only messages (empty content, no tool_calls, but
             // with tool_results) get their content synthesized below.
-            let has_tool_data =
-                !msg.tool_calls.is_empty() || !msg.tool_results.is_empty();
+            let has_tool_data = !msg.tool_calls.is_empty() || !msg.tool_results.is_empty();
             if msg.content.trim().is_empty() && !has_tool_data {
                 continue;
             }
@@ -1064,11 +1063,14 @@ mod tests {
 
         // Build manually the same way write_session does.
         let mut lines: Vec<String> = Vec::new();
-        lines.push(serde_json::to_string(&json!({
-            "type": "session", "id": "2025-01-01T00-00-00_test",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "cwd": "/tmp",
-        })).unwrap());
+        lines.push(
+            serde_json::to_string(&json!({
+                "type": "session", "id": "2025-01-01T00-00-00_test",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "cwd": "/tmp",
+            }))
+            .unwrap(),
+        );
 
         for msg in &session.messages {
             let role_str = match &msg.role {
@@ -1088,11 +1090,14 @@ mod tests {
             }
             let content = serde_json::Value::Array(blocks);
             let inner = json!({"role": role_str, "content": content});
-            lines.push(serde_json::to_string(&json!({
-                "type": "message",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "message": inner,
-            })).unwrap());
+            lines.push(
+                serde_json::to_string(&json!({
+                    "type": "message",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "message": inner,
+                }))
+                .unwrap(),
+            );
         }
         std::fs::write(&target, lines.join("\n") + "\n").unwrap();
 

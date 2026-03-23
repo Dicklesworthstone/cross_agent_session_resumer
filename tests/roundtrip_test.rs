@@ -1640,9 +1640,7 @@ fn roundtrip_codex_exec_tool_results_to_piagent() {
     // Verify the fixture actually has at least one tool-result-only message
     // with empty content (this is the scenario that triggers the bug).
     let has_tool_result_only = session.messages.iter().any(|m| {
-        m.content.trim().is_empty()
-            && m.tool_calls.is_empty()
-            && !m.tool_results.is_empty()
+        m.content.trim().is_empty() && m.tool_calls.is_empty() && !m.tool_results.is_empty()
     });
     assert!(
         has_tool_result_only,
