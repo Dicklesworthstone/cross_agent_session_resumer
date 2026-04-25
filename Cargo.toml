@@ -1,10 +1,27 @@
 [package]
-name = "casr"
-version = "0.1.1"
+name = "cross_agent_session_resumer"
+version = "0.2.1"
 edition = "2024"
-description = "Cross Agent Session Resumer — resume AI coding sessions across providers"
+description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: casr)"
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/cross_agent_session_resumer"
+keywords = ["cli", "agent", "session", "resume", "claude"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+# The package was published on crates.io as `casr` early on, and the binary
+# plus all internal `casr::...` crate-path references throughout main.rs/tests
+# remain on that short name. The `casr` crates.io slot ended up taken by an
+# unrelated project, so we publish the package itself under the longer name
+# while keeping `casr` as both the lib name (for `casr::*` paths) and the
+# binary entry point.
+[lib]
+name = "casr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "casr"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
