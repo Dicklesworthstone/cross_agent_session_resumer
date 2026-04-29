@@ -1,6 +1,6 @@
 [package]
 name = "cross_agent_session_resumer"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: casr)"
 license-file = "LICENSE"
