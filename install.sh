@@ -1420,9 +1420,10 @@ summary_lines=(
   "  casr -cod <session-id>"
   "  casr -gmi <session-id>"
   ""
-  "Uninstall/revert:"
-  "  rm -f $DEST/$BINARY_NAME $DEST/cc $DEST/cod $DEST/gmi"
-  "  rm -rf \$HOME/.claude/skills/casr \$HOME/.codex/skills/casr"
+  "Managed paths:"
+  "  binary:   $(status_path "$DEST/$BINARY_NAME")"
+  "  wrappers: $(status_path "$DEST")/{cc,cod,gmi}"
+  "  skills:   ~/.claude/skills/casr and ~/.codex/skills/casr"
 )
 
 echo ""
@@ -1437,9 +1438,9 @@ if [ "$QUIET" -eq 0 ]; then
           echo ""
           continue
         fi
-        if [[ "$line" == "Get started:" ]] || [[ "$line" == "Uninstall/revert:" ]]; then
+        if [[ "$line" == "Get started:" ]] || [[ "$line" == "Managed paths:" ]]; then
           gum style --foreground 245 "$line"
-        elif [[ "$line" == "  casr "* ]] || [[ "$line" == "  rm "* ]]; then
+        elif [[ "$line" == "  casr "* ]]; then
           gum style --foreground 39 "$line"
         else
           gum style --foreground 245 "$line"
