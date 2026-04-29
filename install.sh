@@ -465,7 +465,7 @@ download_skill_archive() {
       fi
     fi
   done
-  SKILL_ARCHIVE_STATUS="inline fallback (release archive unavailable)"
+  SKILL_ARCHIVE_STATUS="bundled inline skill"
   return 1
 }
 
@@ -1406,7 +1406,7 @@ summary_lines=(
   "Version:          $VERSION"
   "Install source:   $INSTALL_SOURCE"
   "Providers:        $PROV_LIST"
-  "Skill archive:    $SKILL_ARCHIVE_STATUS"
+  "Skill source:     $SKILL_ARCHIVE_STATUS"
   "Claude skill:     $CLAUDE_SKILL_STATUS"
   "Codex skill:      $CODEX_SKILL_STATUS"
   "Wrapper cc:       $CC_WRAPPER_STATUS"
