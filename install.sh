@@ -435,7 +435,7 @@ casr -gmi <session-id>  # open in Gemini
 ```bash
 casr providers
 casr list --workspace "$(pwd)" --sort date --limit 20
-casr resume codex <session-id> --source claude
+casr cod resume <session-id> --source cc
 casr info <session-id> --json
 ```
 
@@ -465,7 +465,7 @@ download_skill_archive() {
       fi
     fi
   done
-  SKILL_ARCHIVE_STATUS="not-found (inline fallback)"
+  SKILL_ARCHIVE_STATUS="inline fallback (release archive unavailable)"
   return 1
 }
 
@@ -525,6 +525,14 @@ configure_agent_skills() {
   fi
 }
 
+status_path() {
+  local path="$1"
+  case "$path" in
+    "$HOME"/*) printf '%s/%s' '~' "${path#"$HOME"/}" ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
 install_wrapper_command() {
   local alias_name="$1"
   local target_name="$2"
@@ -547,13 +555,13 @@ install_wrapper_command() {
     local current_alias_path=""
     current_alias_path=$(command -v "$alias_name" 2>/dev/null || true)
     if [ "$current_alias_path" != "$wrapper_path" ]; then
-      printf -v "$status_var" '%s' "already exists on PATH (${current_alias_path})"
+      printf -v "$status_var" '%s' "already exists on PATH ($(status_path "$current_alias_path"))"
       return 0
     fi
   fi
 
   if [ -f "$wrapper_path" ] && ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null; then
-    printf -v "$status_var" '%s' "skipped (existing unmanaged file at $wrapper_path)"
+    printf -v "$status_var" '%s' "preserved unmanaged ($(status_path "$wrapper_path"))"
     return 0
   fi
 
@@ -563,7 +571,7 @@ $marker
 exec "${target_path}" "\$@"
 EOF
   chmod 0755 "$wrapper_path"
-  printf -v "$status_var" '%s' "installed ($wrapper_path -> $target_name)"
+  printf -v "$status_var" '%s' "installed ($(status_path "$wrapper_path") -> $target_name)"
 }
 
 configure_provider_wrappers() {
