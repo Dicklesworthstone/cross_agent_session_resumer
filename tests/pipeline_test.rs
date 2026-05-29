@@ -267,6 +267,7 @@ fn options(dry_run: bool, source_hint: Option<String>) -> ConvertOptions {
         verbose: false,
         enrich: false,
         source_hint,
+        ..Default::default()
     }
 }
 
@@ -928,6 +929,7 @@ fn pipeline_real_cc_to_codex_happy_path() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect("real CC→Codex pipeline should succeed");
@@ -967,6 +969,7 @@ fn pipeline_real_cc_to_gemini_happy_path() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect("real CC→Gemini pipeline should succeed");
@@ -1000,6 +1003,7 @@ fn pipeline_real_dry_run_skips_write() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect("real dry-run should succeed");
@@ -1035,6 +1039,7 @@ fn pipeline_real_same_provider_short_circuit() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect("real same-provider should short-circuit");
@@ -1079,6 +1084,7 @@ fn pipeline_real_source_hint_narrows_resolution() {
                 verbose: false,
                 enrich: false,
                 source_hint: Some("cc".to_string()),
+                ..Default::default()
             },
         )
         .expect("source hint 'cc' should resolve to ClaudeCode");
@@ -1110,6 +1116,7 @@ fn pipeline_real_session_not_found() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect_err("real not-found should error");
@@ -1136,6 +1143,7 @@ fn pipeline_real_unknown_target_alias() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect_err("unknown alias should error");
@@ -1242,6 +1250,7 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
                 verbose: false,
                 enrich: false,
                 source_hint: None,
+                ..Default::default()
             },
         )
         .expect("conversion should succeed");

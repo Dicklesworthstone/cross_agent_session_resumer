@@ -696,6 +696,82 @@ impl Codex {
                         }
                     }
                 }
+                "compacted" => {
+                    // A compaction replaces all prior history with a condensed
+                    // snapshot the source agent chose to keep in context. Reset
+                    // the accumulated messages to that `replacement_history` so
+                    // the converted session mirrors the source's *live* context
+                    // instead of replaying the full on-disk archive (a long
+                    // session can compact dozens of times; only the last
+                    // snapshot plus the events after it are actually in context).
+                    if let Some(p) = payload {
+                        let mut replacement: Vec<CanonicalMessage> = Vec::new();
+                        if let Some(items) =
+                            p.get("replacement_history").and_then(|v| v.as_array())
+                        {
+                            for item in items {
+                                let payload_type =
+                                    item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                                let role = if matches!(
+                                    payload_type,
+                                    "function_call_output" | "custom_tool_call_output"
+                                ) {
+                                    MessageRole::Tool
+                                } else {
+                                    let role_str = item
+                                        .get("role")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("assistant");
+                                    normalize_role(role_str)
+                                };
+                                let content_val = item.get("content");
+                                let text = codex_extract_text_content(content_val);
+                                let mut tool_calls = codex_extract_tool_calls(content_val);
+                                tool_calls.extend(codex_extract_payload_tool_calls(item));
+                                let mut tool_results = codex_extract_tool_results(content_val);
+                                tool_results.extend(codex_extract_payload_tool_results(item));
+                                if text.trim().is_empty()
+                                    && tool_calls.is_empty()
+                                    && tool_results.is_empty()
+                                {
+                                    continue;
+                                }
+                                replacement.push(CanonicalMessage {
+                                    idx: 0,
+                                    role,
+                                    content: text,
+                                    timestamp: ts,
+                                    author: None,
+                                    tool_calls,
+                                    tool_results,
+                                    extra: serde_json::Value::Null,
+                                });
+                            }
+                        }
+                        // An optional free-text summary accompanying the compaction.
+                        if let Some(summary) = p.get("message").and_then(|v| v.as_str())
+                            && !summary.trim().is_empty()
+                        {
+                            replacement.push(CanonicalMessage {
+                                idx: 0,
+                                role: MessageRole::Assistant,
+                                content: summary.to_string(),
+                                timestamp: ts,
+                                author: Some("summary".to_string()),
+                                tool_calls: vec![],
+                                tool_results: vec![],
+                                extra: serde_json::Value::Null,
+                            });
+                        }
+                        debug!(
+                            line = line_num,
+                            replaced = messages.len(),
+                            kept = replacement.len(),
+                            "codex compaction: resetting history to replacement_history"
+                        );
+                        messages = replacement;
+                    }
+                }
                 _ => {
                     trace!(line = line_num, event_type, "skipping unknown event type");
                 }
@@ -1512,5 +1588,36 @@ not json
             "Assistant without usage should produce one response_item"
         );
         assert_eq!(events[0]["type"], "response_item");
+    }
+
+    #[test]
+    fn reader_jsonl_compaction_resets_to_replacement_history() {
+        // A `compacted` event replaces all prior history with its
+        // replacement_history; only that snapshot plus post-compaction events
+        // should survive (the source agent's live context).
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"id":"sx","cwd":"/tmp/p"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"PRE-COMPACTION ORIGINAL"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pre answer"}]}}"#,
+            "\n",
+            r#"{"type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"KEPT SUMMARY TASK"}]}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"POST answer"}]}}"#,
+        );
+        let session = read_codex_jsonl(content);
+        let joined = session
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            !joined.contains("PRE-COMPACTION"),
+            "pre-compaction history must be dropped, got: {joined}"
+        );
+        assert!(joined.contains("KEPT SUMMARY TASK"), "got: {joined}");
+        assert!(joined.contains("POST answer"), "got: {joined}");
     }
 }

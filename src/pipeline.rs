@@ -29,6 +29,31 @@ pub struct ConvertOptions {
     pub verbose: bool,
     pub enrich: bool,
     pub source_hint: Option<String>,
+    /// Cap the transferred history at roughly this many tokens (0 = unlimited).
+    /// Applied only to cross-provider conversions; mirrors the source agent's
+    /// live context rather than its full archive.
+    pub max_context_tokens: usize,
+    /// Truncate each tool result/observation to this many characters (0 = unlimited).
+    pub max_tool_output: usize,
+    /// Keep source-agent reasoning traces (dropped by default for cross-agent
+    /// handoffs since the target agent cannot use another agent's hidden reasoning).
+    pub keep_reasoning: bool,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        // No-op budgeting by default; the CLI layer supplies the smart caps.
+        ConvertOptions {
+            dry_run: false,
+            force: false,
+            verbose: false,
+            enrich: false,
+            source_hint: None,
+            max_context_tokens: 0,
+            max_tool_output: 0,
+            keep_reasoning: true,
+        }
+    }
 }
 
 /// Outcome of a successful (or dry-run) conversion.
@@ -397,6 +422,22 @@ but resume may fail until the CLI is installed.",
             });
         }
 
+        // 7a2. Context budget (cross-provider only — same-provider short-circuited above).
+        //
+        // The source reader already collapses the on-disk archive to the live
+        // context (honoring compaction). This step keeps that context inside a
+        // target-friendly budget: drop the source agent's hidden reasoning,
+        // truncate oversized tool observations, then drop the oldest turns if
+        // still over the token cap — preserving the original task message and
+        // the most recent history, and never severing tool_use/tool_result pairs.
+        let budget_warnings = apply_context_budget(
+            &mut canonical,
+            opts.max_context_tokens,
+            opts.max_tool_output,
+            opts.keep_reasoning,
+        );
+        all_warnings.extend(budget_warnings);
+
         // 7b. Normalize tool-only messages with empty content.
         //
         // Some source formats (notably Codex with `originator: codex_exec`)
@@ -514,6 +555,150 @@ but resume may fail until the CLI is installed.",
             warnings: all_warnings,
         })
     }
+}
+
+/// Rough token estimate (~4 chars/token) for one message including tool I/O.
+fn estimate_message_tokens(m: &CanonicalMessage) -> usize {
+    let mut chars = m.content.len();
+    for tc in &m.tool_calls {
+        chars += tc.name.len() + tc.arguments.to_string().len();
+    }
+    for tr in &m.tool_results {
+        chars += tr.content.len();
+    }
+    chars / 4 + 1
+}
+
+/// Trim a string to ~`max` chars, keeping head and tail with an elision marker.
+/// Returns `None` if no truncation was needed.
+fn elide_middle(s: &str, max: usize) -> Option<String> {
+    if max == 0 {
+        return None;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return None;
+    }
+    let head_len = max.saturating_mul(2) / 3;
+    let tail_len = max.saturating_sub(head_len);
+    let omitted = chars.len() - head_len - tail_len;
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[chars.len() - tail_len..].iter().collect();
+    Some(format!("{head}\n…[casr: {omitted} chars elided]…\n{tail}"))
+}
+
+/// Remove `tool_use` blocks lacking a matching `tool_result` (and vice versa),
+/// then drop any message left with no content and no tool payloads. Keeps the
+/// session valid for APIs that require paired tool calls/results — important
+/// after older turns are dropped by the token budget.
+fn repair_tool_pairing(session: &mut CanonicalSession) {
+    let result_ids: std::collections::HashSet<String> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_results.iter())
+        .filter_map(|tr| tr.call_id.clone())
+        .collect();
+    let call_ids: std::collections::HashSet<String> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .filter_map(|tc| tc.id.clone())
+        .collect();
+    for m in &mut session.messages {
+        m.tool_calls.retain(|tc| match tc.id.as_deref() {
+            Some(id) => result_ids.contains(id),
+            None => true,
+        });
+        m.tool_results.retain(|tr| match tr.call_id.as_deref() {
+            Some(id) => call_ids.contains(id),
+            None => true,
+        });
+    }
+    session.messages.retain(|m| {
+        !(m.content.trim().is_empty() && m.tool_calls.is_empty() && m.tool_results.is_empty())
+    });
+}
+
+/// Fit a (cross-provider) session into a target-friendly context budget while
+/// preserving its meaning: drop the source agent's hidden reasoning, truncate
+/// oversized tool observations, then drop the oldest turns if still over the
+/// token cap — always pinning the first (task) message and never leaving an
+/// unpaired tool call/result behind. Returns human-readable notes about what
+/// was elided (callers surface these as warnings — never silent).
+fn apply_context_budget(
+    canonical: &mut CanonicalSession,
+    max_tokens: usize,
+    max_tool_output: usize,
+    keep_reasoning: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // 1. Drop source-agent reasoning traces (unusable by another agent).
+    if !keep_reasoning {
+        let before = canonical.messages.len();
+        canonical
+            .messages
+            .retain(|m| m.author.as_deref() != Some("reasoning"));
+        let dropped = before - canonical.messages.len();
+        if dropped > 0 {
+            warnings.push(format!(
+                "Dropped {dropped} source reasoning trace(s); pass --keep-reasoning to retain."
+            ));
+        }
+    }
+
+    // 2. Truncate oversized tool observations (the dominant byte source).
+    if max_tool_output > 0 {
+        let mut truncated = 0usize;
+        for m in &mut canonical.messages {
+            for tr in &mut m.tool_results {
+                if let Some(short) = elide_middle(&tr.content, max_tool_output) {
+                    tr.content = short;
+                    truncated += 1;
+                }
+            }
+        }
+        if truncated > 0 {
+            warnings.push(format!(
+                "Truncated {truncated} oversized tool result(s) to ~{max_tool_output} chars each."
+            ));
+        }
+    }
+
+    // 3. Enforce the token budget by dropping the oldest turns, pinning the
+    //    first (task) message and keeping the most recent history.
+    if max_tokens > 0 && canonical.messages.len() > 1 {
+        let total: usize = canonical.messages.iter().map(estimate_message_tokens).sum();
+        if total > max_tokens {
+            let pinned = estimate_message_tokens(&canonical.messages[0]);
+            let mut budget_left = max_tokens.saturating_sub(pinned);
+            let mut keep_from = canonical.messages.len();
+            for i in (1..canonical.messages.len()).rev() {
+                let t = estimate_message_tokens(&canonical.messages[i]);
+                if t > budget_left {
+                    break;
+                }
+                budget_left -= t;
+                keep_from = i;
+            }
+            if keep_from > 1 {
+                let dropped = keep_from - 1;
+                let tail = canonical.messages.split_off(keep_from);
+                canonical.messages.truncate(1);
+                canonical.messages.extend(tail);
+                warnings.push(format!(
+                    "Context budget (~{max_tokens} tokens) exceeded; dropped {dropped} older \
+turn(s) between the task and the most recent history."
+                ));
+            }
+        }
+    }
+
+    // 4. Keep tool calls/results paired after any dropping, then re-index.
+    repair_tool_pairing(canonical);
+    reindex_messages(&mut canonical.messages);
+
+    warnings
 }
 
 /// Coarse role bucket used for read-back verification.
@@ -879,6 +1064,7 @@ fn find_backup_path(target: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ToolCall, ToolResult};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1156,5 +1342,116 @@ mod tests {
             !target.exists(),
             "target should be removed when no backup is available"
         );
+    }
+
+    // -- Context budget ----------------------------------------------------
+
+    fn bmsg(role: MessageRole, content: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            idx: 0,
+            role,
+            content: content.to_string(),
+            timestamp: None,
+            author: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    fn bsession(messages: Vec<CanonicalMessage>) -> CanonicalSession {
+        CanonicalSession {
+            session_id: "s".into(),
+            provider_slug: "codex".into(),
+            workspace: None,
+            title: None,
+            started_at: None,
+            ended_at: None,
+            messages,
+            metadata: serde_json::Value::Null,
+            source_path: std::path::PathBuf::from("/tmp/x"),
+            model_name: None,
+        }
+    }
+
+    #[test]
+    fn budget_elide_middle_truncates_only_when_needed() {
+        assert!(elide_middle("short", 100).is_none());
+        let long = "x".repeat(1000);
+        let out = elide_middle(&long, 100).expect("should truncate");
+        assert!(out.chars().count() < 250);
+        assert!(out.contains("elided"));
+    }
+
+    #[test]
+    fn budget_drops_reasoning_and_truncates_tool_output() {
+        let mut reasoning = bmsg(MessageRole::Assistant, "secret thoughts");
+        reasoning.author = Some("reasoning".into());
+        let mut call = bmsg(MessageRole::Assistant, "run it");
+        call.tool_calls.push(ToolCall {
+            id: Some("c1".into()),
+            name: "Bash".into(),
+            arguments: serde_json::json!({"cmd": "ls"}),
+        });
+        let mut tool = bmsg(MessageRole::Tool, "");
+        tool.tool_results.push(ToolResult {
+            call_id: Some("c1".into()),
+            content: "y".repeat(50_000),
+            is_error: false,
+        });
+        let mut s = bsession(vec![bmsg(MessageRole::User, "task"), call, tool, reasoning]);
+
+        let warns = apply_context_budget(&mut s, 0, 4000, false);
+
+        assert!(!s.messages.iter().any(|m| m.author.as_deref() == Some("reasoning")));
+        let tr = &s
+            .messages
+            .iter()
+            .find(|m| !m.tool_results.is_empty())
+            .expect("tool result kept")
+            .tool_results[0];
+        assert!(tr.content.chars().count() < 5000, "tool output truncated");
+        assert!(warns.iter().any(|w| w.contains("reasoning")));
+        assert!(warns.iter().any(|w| w.contains("Truncated")));
+    }
+
+    #[test]
+    fn budget_token_cap_drops_oldest_keeps_task_and_recent() {
+        let mut msgs = vec![bmsg(MessageRole::User, "the original task")];
+        for i in 0..50 {
+            let role = if i % 2 == 0 {
+                MessageRole::Assistant
+            } else {
+                MessageRole::User
+            };
+            msgs.push(bmsg(role, &"word ".repeat(500)));
+        }
+        msgs.push(bmsg(MessageRole::Assistant, "FINAL RECENT MESSAGE"));
+        let mut s = bsession(msgs);
+        let before = s.messages.len();
+
+        let warns = apply_context_budget(&mut s, 2000, 0, true);
+
+        assert!(s.messages.len() < before, "older turns dropped");
+        assert_eq!(s.messages.first().unwrap().content, "the original task");
+        assert_eq!(s.messages.last().unwrap().content, "FINAL RECENT MESSAGE");
+        assert!(warns.iter().any(|w| w.contains("Context budget")));
+    }
+
+    #[test]
+    fn budget_repairs_orphan_tool_use() {
+        let mut call = bmsg(MessageRole::Assistant, "");
+        call.tool_calls.push(ToolCall {
+            id: Some("orphan".into()),
+            name: "X".into(),
+            arguments: serde_json::Value::Null,
+        });
+        let mut s = bsession(vec![bmsg(MessageRole::User, "hi"), call]);
+
+        apply_context_budget(&mut s, 0, 0, true);
+
+        // Orphan tool_use removed and the now-empty assistant turn dropped.
+        assert!(s.messages.iter().all(|m| m.tool_calls.is_empty()));
+        assert_eq!(s.messages.len(), 1);
     }
 }

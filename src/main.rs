@@ -74,6 +74,23 @@ enum Command {
         /// Add context messages to help the target agent understand the conversion.
         #[arg(long)]
         enrich: bool,
+
+        /// Cap the transferred history at roughly this many tokens (0 = unlimited).
+        /// Applies to cross-provider conversions; the oldest turns are dropped
+        /// first, pinning the original task and the most recent history.
+        #[arg(long, default_value = "200000")]
+        max_context_tokens: usize,
+
+        /// Truncate each tool result/observation to this many characters
+        /// (0 = unlimited). Tool output is usually the bulk of a long session.
+        #[arg(long, default_value = "4000")]
+        max_tool_output: usize,
+
+        /// Keep the source agent's reasoning traces (dropped by default for
+        /// cross-agent handoffs, since the target can't use another agent's
+        /// hidden reasoning).
+        #[arg(long)]
+        keep_reasoning: bool,
     },
 
     /// List all discoverable sessions across installed providers.
@@ -230,6 +247,9 @@ fn main() -> ExitCode {
             force,
             source,
             enrich,
+            max_context_tokens,
+            max_tool_output,
+            keep_reasoning,
         } => cmd_resume(
             &target,
             &session_id,
@@ -237,6 +257,9 @@ fn main() -> ExitCode {
             force,
             source,
             enrich,
+            max_context_tokens,
+            max_tool_output,
+            keep_reasoning,
             cli.json,
         ),
         Command::List {
@@ -301,6 +324,7 @@ fn error_type_name(e: &anyhow::Error) -> &'static str {
 // Command implementations
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_resume(
     target: &str,
     session_id: &str,
@@ -308,6 +332,9 @@ fn cmd_resume(
     force: bool,
     source: Option<String>,
     enrich: bool,
+    max_context_tokens: usize,
+    max_tool_output: usize,
+    keep_reasoning: bool,
     json_mode: bool,
 ) -> anyhow::Result<()> {
     let registry = ProviderRegistry::default_registry();
@@ -319,6 +346,9 @@ fn cmd_resume(
         verbose: false,
         enrich,
         source_hint: source,
+        max_context_tokens,
+        max_tool_output,
+        keep_reasoning,
     };
 
     let result = pipeline.convert(target, session_id, opts)?;
