@@ -409,36 +409,46 @@ but resume may fail until the CLI is installed.",
         //
         // Fix: materialise the tool-call/result text into `content` on the
         // canonical message itself so that write ↔ readback is consistent.
-        for msg in &mut canonical.messages {
-            if !msg.content.trim().is_empty() {
-                continue;
-            }
-
-            let has_tool_calls = !msg.tool_calls.is_empty();
-            let has_tool_results = !msg.tool_results.is_empty();
-
-            if !has_tool_calls && !has_tool_results {
-                continue;
-            }
-
-            let mut parts: Vec<String> = Vec::new();
-
-            // Synthesize text for tool calls (matches Pi reader's format).
-            for tc in &msg.tool_calls {
-                parts.push(format!("[Tool: {}]", tc.name));
-            }
-
-            // Synthesize text for tool results.
-            for tr in &msg.tool_results {
-                if tr.is_error {
-                    parts.push(format!("[Tool Error] {}", tr.content));
-                } else {
-                    parts.push(format!("[Tool Output] {}", tr.content));
+        //
+        // Skipped for structured-tool targets (Claude Code), which round-trip
+        // `tool_use` / `tool_result` as native content blocks and read them
+        // back into `tool_calls` / `tool_results` (not `content`). Synthesizing
+        // text there would corrupt the round-trip and, worse, force tool output
+        // to be replayed as a text block the Anthropic API rejects alongside
+        // the matching `tool_result`.
+        let target_preserves_tool_blocks = target_provider.slug() == "claude-code";
+        if !target_preserves_tool_blocks {
+            for msg in &mut canonical.messages {
+                if !msg.content.trim().is_empty() {
+                    continue;
                 }
-            }
 
-            if !parts.is_empty() {
-                msg.content = parts.join("\n");
+                let has_tool_calls = !msg.tool_calls.is_empty();
+                let has_tool_results = !msg.tool_results.is_empty();
+
+                if !has_tool_calls && !has_tool_results {
+                    continue;
+                }
+
+                let mut parts: Vec<String> = Vec::new();
+
+                // Synthesize text for tool calls (matches Pi reader's format).
+                for tc in &msg.tool_calls {
+                    parts.push(format!("[Tool: {}]", tc.name));
+                }
+
+                // Synthesize text for tool results.
+                for tr in &msg.tool_results {
+                    if tr.is_error {
+                        parts.push(format!("[Tool Error] {}", tr.content));
+                    } else {
+                        parts.push(format!("[Tool Output] {}", tr.content));
+                    }
+                }
+
+                if !parts.is_empty() {
+                    msg.content = parts.join("\n");
+                }
             }
         }
 

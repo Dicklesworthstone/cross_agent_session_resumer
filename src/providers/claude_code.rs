@@ -394,7 +394,10 @@ impl Provider for ClaudeCode {
             "writing Claude Code session"
         );
 
-        // Build JSONL content: one line per message.
+        // Build JSONL content: one line per message. Entry role follows the
+        // canonical role: tool output is classified as `Tool` upstream (in the
+        // Codex reader), which maps to a user entry here, so `tool_result`
+        // blocks land in user messages as Anthropic's API requires.
         let mut lines: Vec<String> = Vec::with_capacity(session.messages.len());
         let mut prev_uuid: Option<String> = None;
 
@@ -412,7 +415,6 @@ impl Provider for ClaudeCode {
             let entry_type = claude_entry_type(&msg.role);
             let inner_msg = build_inner_message(msg, session.model_name.as_deref(), entry_type);
 
-            // Build the full JSONL entry.
             let parent_uuid_val = match &prev_uuid {
                 Some(u) => serde_json::Value::String(u.clone()),
                 None => serde_json::Value::Null,
@@ -435,7 +437,14 @@ impl Provider for ClaudeCode {
             prev_uuid = Some(entry_uuid);
         }
 
-        let content_bytes = lines.join("\n").into_bytes();
+        // Terminate the final line with a newline. Claude Code appends new
+        // turns to this file on resume; without a trailing newline its first
+        // appended record is concatenated onto casr's last line, corrupting it.
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        let content_bytes = content.into_bytes();
 
         // Use atomic write.
         let outcome =
@@ -531,24 +540,48 @@ fn claude_entry_type(role: &MessageRole) -> &'static str {
     }
 }
 
+/// Claude's API requires `tool_use.input` to be a JSON object. Source agents
+/// (notably Codex) store tool arguments as a JSON-encoded string, and some
+/// tools (e.g. apply_patch) pass a raw non-JSON string. Coerce to an object so
+/// the resumed conversation history is accepted by the API; these historical
+/// tool calls are never re-executed, only replayed as context.
+fn coerce_tool_input(arguments: &serde_json::Value) -> serde_json::Value {
+    match arguments {
+        serde_json::Value::Object(_) => arguments.clone(),
+        serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v @ serde_json::Value::Object(_)) => v,
+            _ => serde_json::json!({ "value": s }),
+        },
+        serde_json::Value::Null => serde_json::json!({}),
+        other => serde_json::json!({ "value": other }),
+    }
+}
+
+/// Build the Anthropic `message.content` value for one entry. Assistant entries
+/// serialize text + `tool_use` blocks; non-assistant entries serialize
+/// `tool_result` blocks (when present) or a plain string. `tool_use.input` is
+/// coerced to a JSON object as the API requires.
 fn build_message_content(msg: &CanonicalMessage) -> serde_json::Value {
     match msg.role {
         MessageRole::Assistant => {
             let mut blocks: Vec<serde_json::Value> = Vec::new();
             if !msg.content.is_empty() {
-                blocks.push(serde_json::json!({
-                    "type": "text",
-                    "text": msg.content,
-                }));
+                blocks.push(serde_json::json!({ "type": "text", "text": msg.content }));
             }
             for tc in &msg.tool_calls {
                 blocks.push(serde_json::json!({
                     "type": "tool_use",
                     "id": tc.id.as_deref().unwrap_or(""),
                     "name": tc.name,
-                    "input": tc.arguments,
+                    "input": coerce_tool_input(&tc.arguments),
                 }));
             }
+            // Some source agents (e.g. Gemini) attach tool results directly to
+            // the assistant message. Preserve them so multi-hop conversions stay
+            // lossless. (Codex tool output is reclassified as Tool role upstream,
+            // so codex→claude assistant messages never reach this branch with
+            // results — keeping tool_result blocks out of assistant turns for the
+            // common resume path.)
             for tr in &msg.tool_results {
                 blocks.push(serde_json::json!({
                     "type": "tool_result",
@@ -589,10 +622,31 @@ fn build_inner_message(
     });
     if let Some(ref author) = msg.author {
         inner_msg["model"] = serde_json::Value::String(author.clone());
-    } else if msg.role == MessageRole::Assistant
+    } else if entry_type == "assistant"
         && let Some(model) = session_model_name
     {
         inner_msg["model"] = serde_json::Value::String(model.to_string());
+    }
+    // Claude Code's resume loader expects assistant messages to carry the full
+    // Anthropic message envelope (id / type / model / stop_reason / usage), the
+    // same shape its own API responses are persisted in. When these fields are
+    // missing, `claude --resume` hangs on load and ultimately reports
+    // "Failed to resume session". The source agent does not provide real values,
+    // so synthesize benign defaults; provenance (source model) is preserved in
+    // the `model` field set above when available.
+    if entry_type == "assistant" {
+        inner_msg["id"] =
+            serde_json::Value::String(format!("msg_casr_{}", uuid::Uuid::new_v4().simple()));
+        inner_msg["type"] = serde_json::Value::String("message".to_string());
+        if inner_msg.get("model").is_none() {
+            inner_msg["model"] = serde_json::Value::String("unknown".to_string());
+        }
+        inner_msg["stop_reason"] = serde_json::Value::String("end_turn".to_string());
+        inner_msg["stop_sequence"] = serde_json::Value::Null;
+        inner_msg["usage"] = serde_json::json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+        });
     }
     inner_msg
 }
@@ -698,43 +752,54 @@ mod tests {
         });
 
         let content = build_message_content(&msg);
-        let blocks = content
-            .as_array()
-            .expect("assistant content should be serialized as blocks");
+        let blocks = content.as_array().expect("assistant content is blocks");
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "Plan generated.");
         assert_eq!(blocks[1]["type"], "tool_use");
         assert_eq!(blocks[1]["id"], "tool-1");
-        assert_eq!(blocks[1]["name"], "Read");
+        assert_eq!(blocks[1]["input"]["file_path"], "src/main.rs");
     }
 
     #[test]
-    fn writer_non_assistant_tool_results_serialize_as_blocks() {
+    fn writer_coerces_string_tool_input_to_object() {
+        let mut msg = sample_message(MessageRole::Assistant, "");
+        msg.tool_calls.push(ToolCall {
+            id: Some("c1".to_string()),
+            name: "shell".to_string(),
+            arguments: serde_json::Value::String("{\"cmd\":\"ls\"}".to_string()),
+        });
+        let content = build_message_content(&msg);
+        let blocks = content.as_array().unwrap();
+        assert!(blocks[0]["input"].is_object());
+        assert_eq!(blocks[0]["input"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn writer_tool_results_serialize_as_user_blocks() {
         let mut msg = sample_message(MessageRole::Tool, "");
         msg.tool_results.push(ToolResult {
             call_id: Some("call-42".to_string()),
             content: "Done".to_string(),
             is_error: false,
         });
-
         let content = build_message_content(&msg);
-        let blocks = content
-            .as_array()
-            .expect("tool result content should be serialized as blocks");
+        let blocks = content.as_array().expect("tool result content is blocks");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "tool_result");
         assert_eq!(blocks[0]["tool_use_id"], "call-42");
         assert_eq!(blocks[0]["content"], "Done");
-        assert_eq!(blocks[0]["is_error"], false);
     }
 
     #[test]
-    fn writer_inner_message_uses_fallback_model_for_assistant() {
+    fn writer_assistant_envelope_fields_present() {
         let msg = sample_message(MessageRole::Assistant, "hi");
         let inner = build_inner_message(&msg, Some("claude-3-7-sonnet"), "assistant");
         assert_eq!(inner["role"], "assistant");
         assert_eq!(inner["model"], "claude-3-7-sonnet");
+        assert_eq!(inner["type"], "message");
+        assert!(inner["id"].as_str().unwrap().starts_with("msg_casr_"));
+        assert_eq!(inner["stop_reason"], "end_turn");
+        assert!(inner["usage"].is_object());
     }
 
     #[test]

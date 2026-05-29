@@ -567,11 +567,24 @@ impl Codex {
                 }
                 "response_item" => {
                     if let Some(p) = payload {
-                        let role_str = p
-                            .get("role")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("assistant");
-                        let role = normalize_role(role_str);
+                        let payload_type =
+                            p.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                        // Tool output events (`function_call_output`) carry no
+                        // `role` and would otherwise default to "assistant",
+                        // placing their results in an assistant turn. Anthropic
+                        // (and Claude Code resume) require tool results in a user
+                        // turn, so classify them as Tool — which target writers
+                        // map to the user/tool side.
+                        let role = if matches!(
+                            payload_type,
+                            "function_call_output" | "custom_tool_call_output"
+                        ) {
+                            MessageRole::Tool
+                        } else {
+                            let role_str =
+                                p.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
+                            normalize_role(role_str)
+                        };
 
                         let content_val = p.get("content");
                         let text = codex_extract_text_content(content_val);
