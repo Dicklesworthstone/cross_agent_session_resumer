@@ -124,6 +124,11 @@ enum Command {
         /// Enrich output with filesystem-derived data (e.g. repo_name from git root).
         #[arg(long)]
         enrich_fs: bool,
+
+        /// Disambiguate when the same session ID exists in multiple providers:
+        /// a provider alias/slug (e.g. `opc`, `cc`) or a direct session file path.
+        #[arg(long)]
+        source: Option<String>,
     },
 
     /// List detected providers and their installation status.
@@ -279,7 +284,8 @@ fn main() -> ExitCode {
         Command::Info {
             session_id,
             enrich_fs,
-        } => cmd_info(&session_id, cli.json, enrich_fs),
+            source,
+        } => cmd_info(&session_id, cli.json, enrich_fs, source),
         Command::Providers => cmd_providers(cli.json),
         Command::Completions { shell } => cmd_completions(&shell),
     };
@@ -1352,9 +1358,15 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_info(session_id: &str, json_mode: bool, enrich_fs: bool) -> anyhow::Result<()> {
+fn cmd_info(
+    session_id: &str,
+    json_mode: bool,
+    enrich_fs: bool,
+    source: Option<String>,
+) -> anyhow::Result<()> {
     let registry = ProviderRegistry::default_registry();
-    let resolved = registry.resolve_session(session_id, None)?;
+    let source_hint = source.as_deref().map(casr::discovery::SourceHint::parse);
+    let resolved = registry.resolve_session(session_id, source_hint.as_ref())?;
     let session = resolved.provider.read_session(&resolved.path)?;
 
     if json_mode {

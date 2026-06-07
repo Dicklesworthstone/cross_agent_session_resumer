@@ -1130,10 +1130,27 @@ fn cli_resume_cc_to_opencode_works_and_is_discoverable() {
         "OpenCode DB should exist after CC→OpenCode conversion"
     );
 
+    // The converted OpenCode session now carries a STABLE id derived from the
+    // source session (the #14 fix), so it shares the source CC session's id and
+    // exists under both providers. A bare lookup is therefore ambiguous...
     casr_cmd(&tmp)
         .args(["--json", "info", opencode_session_id])
         .assert()
-        .success();
+        .failure();
+
+    // ...and `--source` resolves it to the OpenCode copy specifically.
+    let info = casr_cmd(&tmp)
+        .args(["--json", "info", opencode_session_id, "--source", "opc"])
+        .output()
+        .expect("info --source should run");
+    assert!(info.status.success(), "info --source opc should succeed");
+    let info_json: serde_json::Value =
+        serde_json::from_slice(&info.stdout).expect("info --json should parse");
+    assert_eq!(
+        info_json["provider"].as_str().unwrap(),
+        "opencode",
+        "--source opc must resolve to the OpenCode session, not the CC source"
+    );
 }
 
 #[test]
