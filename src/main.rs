@@ -838,6 +838,8 @@ fn cmd_list(
             "factory" => "Factory",
             "openclaw" => "OpenClaw",
             "pi-agent" => "Pi-Agent",
+            "kiro" => "Kiro CLI",
+            "grok" => "Grok Build",
             _ => provider,
         }
     }

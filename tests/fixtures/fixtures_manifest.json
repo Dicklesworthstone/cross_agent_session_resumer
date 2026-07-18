@@ -122,6 +122,14 @@
       "category": "synthetic",
       "intent": "Antigravity (agy) conversation. uuid==db filename stem; content read from sibling brain/<uuid>/.system_generated/logs/transcript.jsonl. Tests housekeeping-step drop, USER_REQUEST unwrap, tool-call extraction, model pin, and gmi disambiguation."
     },
+    "grok_simple": {
+      "provider": "grok",
+      "format": "jsonl",
+      "path": "grok/sessions/%2Fdata%2Fprojects%2Fdemo/019f75d0-aaaa-7bbb-8ccc-b0a1b2c3d4e5/updates.jsonl",
+      "expected": "expected/grok_simple.json",
+      "category": "synthetic",
+      "intent": "Grok Build (grok CLI) session: ACP session-update stream in updates.jsonl + summary.json metadata under sessions/<percent-encoded-cwd>/<uuid>/. Envelope and user_message_chunk/hook_execution/retry_state shapes captured from a real grok 0.2.103 session (sanitized); assistant/tool shapes per the public ACP schema. Tests chunk coalescing, tool_call+tool_call_update merge, unknown-kind tolerance, and summary-driven title/model/workspace."
+    },
     "cline_simple": {
       "provider": "cline",
       "format": "json",

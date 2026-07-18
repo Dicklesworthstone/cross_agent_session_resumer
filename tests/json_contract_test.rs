@@ -259,8 +259,8 @@ fn contract_providers_json_shape() {
         .expect("providers --json should be an array");
     assert_eq!(
         arr.len(),
-        16,
-        "should list 16 providers (CC, Codex, Gemini, Antigravity, Cursor, Cline, Aider, Amp, OpenCode, ChatGPT, ClawdBot, Vibe, Factory, OpenClaw, Pi-Agent, Kiro)"
+        17,
+        "should list 17 providers (CC, Codex, Gemini, Antigravity, Cursor, Cline, Aider, Amp, OpenCode, ChatGPT, ClawdBot, Vibe, Factory, OpenClaw, Pi-Agent, Kiro, Grok)"
     );
 
     for (i, item) in arr.iter().enumerate() {
@@ -300,6 +300,7 @@ fn contract_providers_known_slugs() {
     assert!(slugs.contains(&"openclaw"), "should contain openclaw");
     assert!(slugs.contains(&"pi-agent"), "should contain pi-agent");
     assert!(slugs.contains(&"kiro"), "should contain kiro");
+    assert!(slugs.contains(&"grok"), "should contain grok");
 }
 
 #[test]
@@ -338,6 +339,7 @@ fn contract_providers_aliases_match_slugs() {
             "openclaw" => assert_eq!(*alias, "ocl"),
             "pi-agent" => assert_eq!(*alias, "pi"),
             "kiro" => assert_eq!(*alias, "kr"),
+            "grok" => assert_eq!(*alias, "grk"),
             other => panic!("Unexpected slug: {other}"),
         }
     }
@@ -1045,6 +1047,7 @@ fn contract_list_provider_field_matches_slug() {
         "openclaw",
         "pi-agent",
         "kiro",
+        "grok",
     ];
     for item in items {
         let provider = item["provider"].as_str().unwrap();
@@ -1125,7 +1128,10 @@ fn contract_list_json_native_name_present() {
     let parsed: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     let items = assert_list_envelope(&parsed);
-    assert!(!items.is_empty(), "expected the renamed session in the list");
+    assert!(
+        !items.is_empty(),
+        "expected the renamed session in the list"
+    );
     // `/rename` custom title wins over the auto-generated ai-title.
     assert_eq!(items[0]["native_name"].as_str(), Some("My Renamed Session"));
 }

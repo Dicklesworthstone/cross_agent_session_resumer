@@ -100,10 +100,12 @@ claude --resume <new-session-id>
 | OpenClaw | `ocl` | Yes | Yes | `openclaw --resume <session-id>` |
 | Pi-Agent | `pi` | Yes | Yes | `pi --session <path-to-session.jsonl>` |
 | Kiro CLI | `kr` | Yes | Yes | `kiro-cli --resume-id <session-id>` |
+| Grok Build | `grk` | Yes | No | `grok --resume <session-id>` |
 
 Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
 - Additional providers are implemented through the same `Provider` trait model.
+- Grok Build (xAI's official `grok` CLI) is currently read/resume-only: use it as a conversion source; writing into Grok is pending round-trip verification against a live `grok --resume`.
 
 ## Installation
 

@@ -10,6 +10,10 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 > Commits on `main` since the v0.1.1 tag (`be1ce19`, 2026-03-03). No GitHub Release yet.
 
+### New Providers
+
+- **Grok Build (read-only)**: new `grok` provider (alias `grk`) for xAI's official `grok` CLI ([#19](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/19)). Reads the ACP session-update stream (`updates.jsonl`) plus `summary.json` metadata under `$GROK_HOME/sessions/<percent-encoded-cwd>/<session-uuid>/`, coalescing streamed message/thought chunks and merging `tool_call`/`tool_call_update` events; unknown update kinds are skipped tolerantly. `write_session` returns an explanatory error (Antigravity-style read/resume-only) pending round-trip verification against a live `grok --resume <session-id>`.
+
 ### Structured Responses and Workspace Enrichment
 
 - **Responses module with typed JSON envelope**: new `responses` module emitting versioned, typed JSON structs for CLI output, preventing schema drift between versions ([`435fd0a`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/435fd0a7ba2ca841831b0b881db9772cea538f0b), [`4b99a2f`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/4b99a2f53634b99748b1609063a69646038187cc)). Addresses proposals [#6](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/6) and [#8](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/8).

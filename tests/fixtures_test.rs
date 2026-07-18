@@ -18,6 +18,7 @@ use casr::providers::codex::Codex;
 use casr::providers::cursor::Cursor;
 use casr::providers::factory::Factory;
 use casr::providers::gemini::Gemini;
+use casr::providers::grok::Grok;
 use casr::providers::openclaw::OpenClaw;
 use casr::providers::opencode::OpenCode;
 use casr::providers::pi_agent::PiAgent;
@@ -360,6 +361,50 @@ fn fixture_gmi_gemini_role() {
         .expect("gmi_gemini_role should parse");
     let expected = load_expected("gmi_gemini_role");
     assert_session_matches(&session, &expected, "gmi_gemini_role");
+}
+
+// ---------------------------------------------------------------------------
+// Grok Build (grk) fixtures
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fixture_grok_simple() {
+    let path = fixtures_dir().join(
+        "grok/sessions/%2Fdata%2Fprojects%2Fdemo/019f75d0-aaaa-7bbb-8ccc-b0a1b2c3d4e5/updates.jsonl",
+    );
+    let session = Grok.read_session(&path).expect("grok_simple should parse");
+    let expected = load_expected("grok_simple");
+    assert_session_matches(&session, &expected, "grok_simple");
+
+    // Chunk coalescing: both user_message_chunk fragments landed in one message.
+    assert_eq!(
+        session.messages[0].content,
+        "Run the shell command: echo hi . Then reply with exactly: done"
+    );
+    // Thought chunk is a separate reasoning-authored assistant message.
+    assert_eq!(session.messages[1].author.as_deref(), Some("reasoning"));
+    // tool_call + tool_call_update merged into the same assistant message,
+    // without breaking agent_message_chunk coalescing around them.
+    let tool_msg = &session.messages[2];
+    assert_eq!(tool_msg.content, "Running the command now. done");
+    assert_eq!(tool_msg.tool_calls.len(), 1);
+    assert_eq!(tool_msg.tool_calls[0].id.as_deref(), Some("call_1"));
+    assert_eq!(tool_msg.tool_calls[0].name, "Run echo hi");
+    assert_eq!(tool_msg.tool_results.len(), 1);
+    assert_eq!(tool_msg.tool_results[0].content, "hi\n");
+    assert!(!tool_msg.tool_results[0].is_error);
+
+    // Resume command uses the documented flag.
+    assert_eq!(
+        Grok.resume_command(&session.session_id),
+        "grok --resume 019f75d0-aaaa-7bbb-8ccc-b0a1b2c3d4e5"
+    );
+
+    // The generated title is surfaced as the provider-native session name.
+    assert_eq!(
+        casr::model::native_name_from_metadata(&session.metadata).as_deref(),
+        Some("Echo hi probe session")
+    );
 }
 
 // ---------------------------------------------------------------------------

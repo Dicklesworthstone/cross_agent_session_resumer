@@ -115,6 +115,7 @@ impl ProviderRegistry {
             Box::new(crate::providers::openclaw::OpenClaw),
             Box::new(crate::providers::pi_agent::PiAgent),
             Box::new(crate::providers::kiro::Kiro),
+            Box::new(crate::providers::grok::Grok),
         ])
     }
 
@@ -454,6 +455,7 @@ fn canonical_provider_token(token: &str) -> &str {
         "codex-cli" => "codex",
         "gemini-cli" => "gemini",
         "antigravity-cli" => "antigravity",
+        "grok-build" | "grok-cli" => "grok",
         _ => token,
     }
 }
@@ -492,6 +494,11 @@ impl ProviderRegistry {
 
                     if value.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
                         return self.find_by_slug("codex");
+                    }
+                    // Grok Build: ACP session-update envelope lines
+                    // ({"params":{"update":{"sessionUpdate": …}}}).
+                    if value.pointer("/params/update/sessionUpdate").is_some() {
+                        return self.find_by_slug("grok");
                     }
                     // Factory: JSONL with session_start typed entry.
                     if value.get("type").and_then(|v| v.as_str()) == Some("session_start") {
