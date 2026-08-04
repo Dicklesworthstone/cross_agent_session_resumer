@@ -407,6 +407,52 @@ fn fixture_grok_simple() {
     );
 }
 
+#[test]
+fn fixture_grok_tools_real() {
+    let path = fixtures_dir().join(
+        "grok/sessions/%2Fdata%2Fprojects%2Fdemo/019fcac9-2222-7333-8444-555566667777/updates.jsonl",
+    );
+    let session = Grok
+        .read_session(&path)
+        .expect("grok_tools_real should parse");
+    let expected = load_expected("grok_tools_real");
+    assert_session_matches(&session, &expected, "grok_tools_real");
+
+    // Verbatim 0.2.118 shapes: the thought chunk splits from the message
+    // chunk (same promptId, different kind)…
+    assert_eq!(session.messages[1].author.as_deref(), Some("reasoning"));
+    assert_eq!(
+        session.messages[1].content,
+        "The user wants a summary of README.md."
+    );
+    // …and the post-tool agent_message_chunk continues the SAME assistant
+    // message because the promptId marker is unchanged.
+    let tool_msg = &session.messages[2];
+    assert_eq!(
+        tool_msg.content,
+        "Reading README.md now. It's a demo project with a short README."
+    );
+    assert_eq!(tool_msg.tool_calls.len(), 1);
+    // The status-null enrichment update replaced the internal tool name with
+    // the human-readable title and the variant-tagged rawInput.
+    assert_eq!(
+        tool_msg.tool_calls[0].name,
+        "Read `/data/projects/demo/README.md`"
+    );
+    assert_eq!(tool_msg.tool_calls[0].arguments["variant"], "ReadFile");
+    assert_eq!(tool_msg.tool_results.len(), 1);
+    assert_eq!(
+        tool_msg.tool_results[0].content,
+        "1→# Demo\n\nA demo project.\n"
+    );
+    assert!(!tool_msg.tool_results[0].is_error);
+
+    // The second prompt (promptIndex 1) and its reply (new promptId) are
+    // separate messages — the boundary markers break coalescing.
+    assert_eq!(session.messages[3].content, "thanks");
+    assert_eq!(session.messages[4].content, "You're welcome.");
+}
+
 // ---------------------------------------------------------------------------
 // Antigravity (agy) fixtures
 // ---------------------------------------------------------------------------

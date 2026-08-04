@@ -20,7 +20,7 @@
 //! `/resume` and session restore", so it is the read source here;
 //! `summary.json` supplies metadata.
 //!
-//! ## `updates.jsonl` line envelope (empirical, grok 0.2.103)
+//! ## `updates.jsonl` line envelope (empirical, grok 0.2.103 + 0.2.118)
 //!
 //! ```json
 //! {"timestamp": 1784388059,
@@ -28,7 +28,8 @@
 //!  "params": {
 //!    "sessionId": "<uuid>",
 //!    "update": {"sessionUpdate": "<kind>", …},
-//!    "_meta": {"eventId": "…", "agentTimestampMs": 1784388056266}}}
+//!    "_meta": {"eventId": "…", "agentTimestampMs": 1784388056266,
+//!              "promptId": "…", …}}}
 //! ```
 //!
 //! Some lines carry `_meta` inside `update` instead (observed:
@@ -36,22 +37,39 @@
 //! locations are consulted. `sessionUpdate` kinds are the Agent Client
 //! Protocol standard set (`user_message_chunk`, `agent_message_chunk`,
 //! `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`) plus x.ai
-//! extensions observed empirically (`hook_execution`, `retry_state`). Unknown
-//! kinds are skipped tolerantly. Chunk kinds are streaming fragments;
-//! consecutive same-kind chunks are coalesced into a single message.
+//! extensions observed empirically (`hook_execution`, `retry_state`,
+//! `task_backgrounded`, `task_completed`, `turn_completed`, `session_recap`).
+//! Unknown kinds are skipped tolerantly. Chunk kinds are streaming fragments;
+//! consecutive same-kind chunks are coalesced into a single message, with a
+//! coalescing break whenever the line's prompt marker changes
+//! (`params._meta.promptId`, or `update._meta.promptIndex` for user chunks) —
+//! chunks of one streamed message always share their prompt marker in real
+//! sessions, so a marker change means a new message even without an
+//! intervening kind change.
 //!
-//! **Honesty note:** the `user_message_chunk` shape plus the extension kinds
-//! were captured from a real 0.2.103 session; `agent_message_chunk`,
-//! `agent_thought_chunk`, `tool_call`, and `tool_call_update` shapes follow
-//! the public ACP schema (agentclientprotocol.com), which the CLI's own docs
-//! name as its update format — parse defensively either way.
+//! All shapes above — including `agent_message_chunk`, `agent_thought_chunk`,
+//! `tool_call` (with `rawInput` and `_meta["x.ai/tool"]`), and
+//! `tool_call_update` (with `status`, `content`, `rawOutput`) — were captured
+//! verbatim from real grok 0.2.103/0.2.118 sessions on disk.
 //!
 //! ## Write support
 //!
-//! Read-only for now (Antigravity-style): a synthesized session tree has not
-//! yet been round-trip verified against a live `grok --resume`, so
-//! [`Provider::write_session`] returns an actionable error rather than
-//! writing an un-resumable stub.
+//! [`Provider::write_session`] synthesizes a native session tree —
+//! `updates.jsonl` (the authoritative log) plus `summary.json` (the index
+//! entry) under a fresh UUIDv7 in the percent-encoded-cwd group — and was
+//! round-trip verified against a live `grok --resume` (grok 0.2.118): the CLI
+//! lists the synthesized session (`grok sessions list`), renders its full
+//! transcript (`grok export <id>`), and restores its conversation context on
+//! `grok -p … -r <id>` (the model answered from facts present only in the
+//! synthesized history). `chat_history.jsonl` is intentionally NOT written:
+//! resume was verified to rebuild model context from `updates.jsonl` alone,
+//! and real `chat_history.jsonl` entries contain provider-encrypted reasoning
+//! blobs casr cannot synthesize.
+//!
+//! Lossiness on write: Grok's update stream has no system/tool message kind,
+//! so non-user, non-assistant roles are written as `user_message_chunk` lines
+//! (content preserved; role collapses to "user" on read-back, matching the
+//! pipeline's role-bucket verification).
 //!
 //! ## Resume
 //!
@@ -72,6 +90,14 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 
 /// Provider slug used in canonical metadata.
 const SLUG: &str = "grok";
+
+/// Model id stamped into written sessions when the source model is not a
+/// Grok model. `summary.json.current_model_id` is REQUIRED for
+/// `grok --resume <id>` to load a session (live-bisected on grok 0.2.118:
+/// without it the CLI reports "Session does not exist"), and a foreign model
+/// id would confuse resume-time model selection. The CLI tolerates historical
+/// model ids in old sessions, so a point-in-time default is safe.
+const DEFAULT_MODEL_ID: &str = "grok-4.5";
 
 /// Grok Build provider implementation.
 pub struct Grok;
@@ -188,6 +214,32 @@ fn line_timestamp(line: &serde_json::Value, update: &serde_json::Value) -> Optio
                 .and_then(parse_timestamp)
         })
         .or_else(|| line.get("timestamp").and_then(parse_timestamp))
+}
+
+/// Extract the prompt marker used to detect message boundaries between
+/// consecutive same-kind chunks.
+///
+/// Agent-side lines carry `params._meta.promptId` (one UUID per user prompt /
+/// streamed reply); user chunks carry `update._meta.promptIndex` instead.
+/// Chunks of one streamed message always share their marker, so a marker
+/// change between consecutive message-bearing lines means a new message.
+/// Lines without either marker return `None` (no boundary inferred).
+fn boundary_key(line: &serde_json::Value, update: &serde_json::Value) -> Option<String> {
+    if let Some(id) = line
+        .pointer("/params/_meta/promptId")
+        .and_then(|v| v.as_str())
+    {
+        return Some(format!("pid:{id}"));
+    }
+    if let Some(idx) = update.pointer("/_meta/promptIndex") {
+        if let Some(n) = idx.as_i64() {
+            return Some(format!("pi:{n}"));
+        }
+        if let Some(s) = idx.as_str() {
+            return Some(format!("pi:{s}"));
+        }
+    }
+    None
 }
 
 /// Flatten an ACP `ToolCallContent` array (from `tool_call` /
@@ -582,6 +634,9 @@ impl Provider for Grok {
         let mut builder = MessageBuilder::default();
         let mut started_at: Option<i64> = None;
         let mut ended_at: Option<i64> = None;
+        // Prompt marker of the previous message-bearing line (see
+        // `boundary_key`); a change breaks chunk coalescing.
+        let mut last_boundary: Option<String> = None;
 
         if updates_path.is_file() {
             let content = std::fs::read_to_string(&updates_path)
@@ -611,6 +666,23 @@ impl Provider for Grok {
                 if let Some(t) = ts {
                     started_at = Some(started_at.map_or(t, |s: i64| s.min(t)));
                     ended_at = Some(ended_at.map_or(t, |e: i64| e.max(t)));
+                }
+
+                // Message-bearing kinds participate in boundary tracking:
+                // a prompt-marker change starts a new message even when the
+                // chunk kind stays the same (e.g. two consecutive prompts).
+                if matches!(
+                    kind,
+                    "user_message_chunk"
+                        | "agent_message_chunk"
+                        | "agent_thought_chunk"
+                        | "tool_call"
+                ) {
+                    let key = boundary_key(&val, update);
+                    if key != last_boundary {
+                        builder.last_kind = None;
+                    }
+                    last_boundary = key;
                 }
 
                 match kind {
@@ -742,20 +814,281 @@ impl Provider for Grok {
 
     fn write_session(
         &self,
-        _session: &CanonicalSession,
-        _opts: &WriteOptions,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        // A Grok Build session directory is more than updates.jsonl (the CLI
-        // also maintains chat_history.jsonl, summary.json, signals.json, and a
-        // SQLite search index), and a synthesized tree has not yet been
-        // round-trip verified against a live `grok --resume`. Refuse rather
-        // than write a stub the CLI may reject or mis-restore.
-        Err(anyhow::anyhow!(
-            "Grok Build (grok) is read/resume-only for now: casr cannot yet create a \
-             resumable Grok session from another provider's history. Use Grok as a \
-             conversion SOURCE (e.g. `casr cc resume <grok-session-id> --source grk`), \
-             not a target."
-        ))
+        let home = Self::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine Grok home directory"))?;
+
+        // Grok generates UUIDv7 session ids; a new id avoids clobbering the
+        // source session on same-machine conversions.
+        let session_id = uuid::Uuid::now_v7().to_string();
+
+        let workspace = crate::model::effective_workspace(session);
+        let workspace_str = workspace.to_string_lossy().to_string();
+
+        // Group directory: URL-encoded cwd; slug+hash with a `.cwd` marker
+        // when the encoded name would exceed 255 bytes (matching the CLI's
+        // documented long-path escape hatch; its exact slug scheme is not
+        // observable, so `grok sessions list` may not associate the group
+        // with the workspace — resume-by-id is unaffected).
+        let mut warnings: Vec<String> = Vec::new();
+        let encoded = urlencoding::encode(&workspace_str).into_owned();
+        let (group_name, needs_cwd_marker) = if encoded.len() > 255 {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(workspace_str.as_bytes());
+            let hash_hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+            // `encoded` is pure ASCII, so byte truncation is char-safe.
+            let prefix = &encoded[..encoded.len().min(200)];
+            warnings.push(format!(
+                "encoded workspace path exceeds 255 bytes; wrote hashed group \
+                 directory '{prefix}-{hash_hex}' with a .cwd marker — \
+                 `grok sessions list` may not associate it with the workspace, \
+                 but `grok --resume {session_id}` still works"
+            ));
+            (format!("{prefix}-{hash_hex}"), true)
+        } else {
+            (encoded, false)
+        };
+
+        let group_dir = home.join("sessions").join(&group_name);
+        let session_dir = group_dir.join(&session_id);
+        let updates_path = session_dir.join("updates.jsonl");
+        let summary_path = session_dir.join("summary.json");
+
+        debug!(
+            session_id,
+            path = %updates_path.display(),
+            messages = session.messages.len(),
+            "writing Grok session"
+        );
+
+        // ------------------------------------------------------------------
+        // updates.jsonl — one ACP session-update event per line.
+        // ------------------------------------------------------------------
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let fallback_ms = session.started_at.unwrap_or(now_ms);
+        let mut lines: Vec<String> = Vec::new();
+        let mut event_seq: u64 = 0;
+        let mut prompt_index: i64 = 0;
+
+        let mut push_line = |update: serde_json::Value,
+                             ts_ms: i64,
+                             prompt_id: Option<&str>,
+                             lines: &mut Vec<String>|
+         -> anyhow::Result<()> {
+            event_seq += 1;
+            let mut params_meta = serde_json::Map::new();
+            params_meta.insert(
+                "eventId".into(),
+                serde_json::Value::String(format!("{session_id}-{event_seq}")),
+            );
+            params_meta.insert("agentTimestampMs".into(), serde_json::json!(ts_ms));
+            if let Some(pid) = prompt_id {
+                params_meta.insert("promptId".into(), serde_json::Value::String(pid.into()));
+            }
+            let line = serde_json::json!({
+                "timestamp": ts_ms.div_euclid(1000),
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": update,
+                    "_meta": serde_json::Value::Object(params_meta),
+                }
+            });
+            lines.push(serde_json::to_string(&line)?);
+            Ok(())
+        };
+
+        for (i, msg) in session.messages.iter().enumerate() {
+            let ts_ms = msg.timestamp.unwrap_or(fallback_ms + i as i64);
+            if msg.role == crate::model::MessageRole::Assistant {
+                // One promptId per canonical assistant message: chunks of one
+                // streamed message share their marker, so distinct markers
+                // keep distinct messages apart on read-back.
+                let prompt_id = uuid::Uuid::new_v4().to_string();
+                let is_thought = msg.author.as_deref() == Some("reasoning")
+                    && msg.tool_calls.is_empty()
+                    && msg.tool_results.is_empty();
+                let kind = if is_thought {
+                    "agent_thought_chunk"
+                } else {
+                    "agent_message_chunk"
+                };
+                if !msg.content.is_empty() {
+                    push_line(
+                        serde_json::json!({
+                            "sessionUpdate": kind,
+                            "content": {"type": "text", "text": msg.content},
+                        }),
+                        ts_ms,
+                        Some(&prompt_id),
+                        &mut lines,
+                    )?;
+                }
+                // Tool calls, then their results, in canonical order.
+                let mut call_ids: Vec<String> = Vec::with_capacity(msg.tool_calls.len());
+                for (n, call) in msg.tool_calls.iter().enumerate() {
+                    let call_id = call
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("call-casr-{i}-{n}"));
+                    call_ids.push(call_id.clone());
+                    push_line(
+                        serde_json::json!({
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": call_id,
+                            "title": call.name,
+                            "status": "pending",
+                            "rawInput": call.arguments,
+                        }),
+                        ts_ms,
+                        Some(&prompt_id),
+                        &mut lines,
+                    )?;
+                }
+                for (n, result) in msg.tool_results.iter().enumerate() {
+                    let call_id = result
+                        .call_id
+                        .clone()
+                        .or_else(|| call_ids.get(n).cloned())
+                        .unwrap_or_else(|| format!("call-casr-{i}-r{n}"));
+                    let status = if result.is_error {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    push_line(
+                        serde_json::json!({
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": call_id,
+                            "status": status,
+                            "content": [
+                                {"type": "content",
+                                 "content": {"type": "text", "text": result.content}}
+                            ],
+                        }),
+                        ts_ms,
+                        Some(&prompt_id),
+                        &mut lines,
+                    )?;
+                }
+            } else {
+                // Grok's update stream has no system/tool kind: non-assistant
+                // roles are preserved as user chunks (content intact, role
+                // collapsing to the "user" bucket on read-back).
+                push_line(
+                    serde_json::json!({
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": msg.content},
+                        "_meta": {"promptIndex": prompt_index},
+                    }),
+                    ts_ms,
+                    None,
+                    &mut lines,
+                )?;
+                prompt_index += 1;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // summary.json — the index entry (shape captured from real sessions).
+        // ------------------------------------------------------------------
+        let iso = |ms: i64| -> String {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        };
+        let created_ms = session.started_at.unwrap_or(now_ms);
+        let updated_ms = session.ended_at.unwrap_or(created_ms);
+        let title = session.title.clone().or_else(|| {
+            session
+                .messages
+                .iter()
+                .find(|m| m.role == crate::model::MessageRole::User)
+                .map(|m| crate::model::truncate_title(&m.content, 100))
+        });
+        let mut summary = serde_json::Map::new();
+        summary.insert(
+            "info".into(),
+            serde_json::json!({"id": session_id, "cwd": workspace_str}),
+        );
+        if let Some(t) = title.as_ref() {
+            summary.insert("session_summary".into(), serde_json::json!(t));
+            summary.insert("generated_title".into(), serde_json::json!(t));
+        }
+        summary.insert("created_at".into(), serde_json::json!(iso(created_ms)));
+        summary.insert("updated_at".into(), serde_json::json!(iso(updated_ms)));
+        summary.insert("last_active_at".into(), serde_json::json!(iso(updated_ms)));
+        summary.insert("num_messages".into(), serde_json::json!(lines.len()));
+        summary.insert(
+            "num_chat_messages".into(),
+            serde_json::json!(session.messages.len()),
+        );
+        // `current_model_id` is REQUIRED: live bisection against grok 0.2.118
+        // showed `grok --resume <id>` fails with "Session does not exist"
+        // when summary.json lacks it (all other optional fields — agent_name,
+        // sandbox_profile, next_trace_turn — proved unnecessary). Keep the
+        // source model only when it is a Grok model; a foreign id (e.g. a
+        // Claude model) would confuse resume-time model selection, so fall
+        // back to the current default coding model.
+        let model_id = session
+            .model_name
+            .as_deref()
+            .filter(|m| m.to_ascii_lowercase().starts_with("grok"))
+            .unwrap_or(DEFAULT_MODEL_ID);
+        summary.insert("current_model_id".into(), serde_json::json!(model_id));
+        summary.insert("chat_format_version".into(), serde_json::json!(1));
+        summary.insert(
+            "grok_home".into(),
+            serde_json::json!(home.to_string_lossy()),
+        );
+
+        // ------------------------------------------------------------------
+        // Write (atomic, honoring --force semantics per file).
+        // ------------------------------------------------------------------
+        let updates_content = if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n") + "\n"
+        };
+        let updates_outcome = crate::pipeline::atomic_write(
+            &updates_path,
+            updates_content.as_bytes(),
+            opts.force,
+            self.slug(),
+        )?;
+        let summary_content =
+            serde_json::to_string_pretty(&serde_json::Value::Object(summary))? + "\n";
+        let summary_outcome = crate::pipeline::atomic_write(
+            &summary_path,
+            summary_content.as_bytes(),
+            opts.force,
+            self.slug(),
+        )?;
+        if needs_cwd_marker {
+            let cwd_marker = group_dir.join(".cwd");
+            if !cwd_marker.exists() {
+                std::fs::write(&cwd_marker, format!("{workspace_str}\n")).map_err(|e| {
+                    anyhow::anyhow!("failed to write {}: {e}", cwd_marker.display())
+                })?;
+            }
+        }
+
+        info!(
+            session_id,
+            path = %updates_outcome.target_path.display(),
+            messages = session.messages.len(),
+            "Grok session written"
+        );
+
+        Ok(WrittenSession {
+            paths: vec![updates_outcome.target_path, summary_outcome.target_path],
+            session_id: session_id.clone(),
+            resume_command: self.resume_command(&session_id),
+            backup_path: updates_outcome.backup_path,
+            warnings,
+        })
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -1196,26 +1529,5 @@ mod tests {
             Grok.resume_command(SESSION_ID),
             format!("grok --resume {SESSION_ID}")
         );
-    }
-
-    #[test]
-    fn write_session_is_refused() {
-        let session = CanonicalSession {
-            session_id: "x".to_string(),
-            provider_slug: "claude-code".to_string(),
-            workspace: None,
-            title: None,
-            started_at: None,
-            ended_at: None,
-            messages: vec![],
-            metadata: serde_json::Value::Null,
-            source_path: PathBuf::from("/tmp/x"),
-            model_name: None,
-        };
-        let err = Grok
-            .write_session(&session, &WriteOptions { force: false })
-            .expect_err("grok must refuse writes");
-        assert!(err.to_string().contains("read/resume-only"));
-        assert!(err.to_string().contains("SOURCE"));
     }
 }

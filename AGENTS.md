@@ -434,7 +434,7 @@ cross_agent_session_resumer/
 │       ├── openclaw.rs              # OpenClaw reader/writer
 │       ├── pi_agent.rs             # Pi Agent reader/writer
 │       ├── kiro.rs                  # Kiro CLI reader/writer
-│       ├── grok.rs                  # Grok Build reader (read/resume-only)
+│       ├── grok.rs                  # Grok Build reader/writer
 │       └── vibe.rs                  # Vibe reader/writer
 ├── tests/                            # Integration tests
 ├── scripts/                          # E2E and smoke test scripts
@@ -465,7 +465,7 @@ cross_agent_session_resumer/
   - `cod` -> Codex
   - `agy` -> Antigravity CLI (read/resume only; `agy --conversation <uuid> --model "Gemini 3.1 Pro (High)"`)
   - `gmi` -> Gemini CLI (legacy)
-  - `grk` -> Grok Build (read/resume only; `grok --resume <session-id>`)
+  - `grk` -> Grok Build (read + write; `grok --resume <session-id>`)
 - Provider home overrides:
   - `CLAUDE_HOME`
   - `CODEX_HOME`

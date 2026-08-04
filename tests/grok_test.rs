@@ -125,45 +125,130 @@ fn read_session_from_seeded_home_matches_fixture_expectations() {
 }
 
 #[test]
-fn write_session_is_refused_read_only_provider() {
-    use casr::model::{CanonicalMessage, CanonicalSession};
+fn write_session_round_trips_through_reader() {
+    use casr::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
 
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _env = EnvGuard::set("GROK_HOME", tmp.path());
 
+    let msg = |idx: usize, role: MessageRole, content: &str, ts: i64| CanonicalMessage {
+        idx,
+        role,
+        content: content.into(),
+        timestamp: Some(ts),
+        author: None,
+        tool_calls: vec![],
+        tool_results: vec![],
+        extra: serde_json::Value::Null,
+    };
+    let mut tool_msg = msg(
+        2,
+        MessageRole::Assistant,
+        "Running the command.",
+        1_784_388_020_000,
+    );
+    tool_msg.tool_calls.push(ToolCall {
+        id: Some("call_a".into()),
+        name: "run_terminal_cmd".into(),
+        arguments: serde_json::json!({"command": "echo hi"}),
+    });
+    tool_msg.tool_results.push(ToolResult {
+        call_id: Some("call_a".into()),
+        content: "hi\n".into(),
+        is_error: false,
+    });
+    let mut thought = msg(
+        3,
+        MessageRole::Assistant,
+        "Reflecting on the output.",
+        1_784_388_025_000,
+    );
+    thought.author = Some("reasoning".into());
+
     let session = CanonicalSession {
         session_id: "foreign".into(),
         provider_slug: "claude-code".into(),
         workspace: Some(PathBuf::from("/data/projects/foo")),
-        title: Some("Hello".into()),
-        started_at: Some(1_700_000_000_000),
-        ended_at: Some(1_700_000_100_000),
-        messages: vec![CanonicalMessage {
-            idx: 0,
-            role: MessageRole::User,
-            content: "Hi there".into(),
-            timestamp: Some(1_700_000_000_000),
-            author: Some("user".into()),
-            tool_calls: vec![],
-            tool_results: vec![],
-            extra: serde_json::Value::Null,
-        }],
+        title: Some("Writer round-trip".into()),
+        started_at: Some(1_784_388_000_000),
+        ended_at: Some(1_784_388_100_000),
+        messages: vec![
+            // Two consecutive user prompts must stay two messages (the writer
+            // stamps distinct promptIndex markers; the reader breaks on them).
+            msg(0, MessageRole::User, "Run echo hi", 1_784_388_000_000),
+            msg(1, MessageRole::User, "And be quick", 1_784_388_010_000),
+            tool_msg,
+            thought,
+            // Two consecutive assistant messages must also stay separate
+            // (distinct promptId markers).
+            msg(4, MessageRole::Assistant, "Done: hi", 1_784_388_030_000),
+            msg(5, MessageRole::System, "system note", 1_784_388_040_000),
+        ],
         metadata: serde_json::Value::Object(serde_json::Map::new()),
         source_path: PathBuf::from("/nonexistent"),
-        model_name: None,
+        model_name: Some("claude-opus-4".into()),
     };
 
-    let err = Grok
-        .write_session(&session, &WriteOptions { force: true })
-        .expect_err("grok must refuse writes");
-    let msg = err.to_string();
-    assert!(msg.contains("read/resume-only"), "unhelpful error: {msg}");
-    // Nothing may have been written into GROK_HOME.
-    assert!(
-        !tmp.path().join("sessions").exists(),
-        "refused write must not create session dirs"
+    let written = Grok
+        .write_session(&session, &WriteOptions { force: false })
+        .expect("grok write succeeds");
+    assert_ne!(written.session_id, "foreign", "fresh UUID session id");
+    assert!(written.paths[0].ends_with("updates.jsonl"));
+    assert!(written.paths[1].ends_with("summary.json"));
+    assert_eq!(
+        written.resume_command,
+        format!("grok --resume {}", written.session_id)
     );
+    assert!(written.warnings.is_empty(), "{:?}", written.warnings);
+
+    // The session must be discoverable exactly like a native one.
+    let owned = Grok
+        .owns_session(&written.session_id)
+        .expect("written session is owned");
+    assert_eq!(owned, written.paths[0]);
+
+    let readback = Grok.read_session(&written.paths[0]).expect("read back");
+    assert_eq!(readback.session_id, written.session_id);
+    assert_eq!(readback.messages.len(), 6, "{:#?}", readback.messages);
+    assert_eq!(readback.messages[0].role, MessageRole::User);
+    assert_eq!(readback.messages[0].content, "Run echo hi");
+    assert_eq!(readback.messages[1].role, MessageRole::User);
+    assert_eq!(readback.messages[1].content, "And be quick");
+    assert_eq!(readback.messages[2].role, MessageRole::Assistant);
+    assert_eq!(readback.messages[2].content, "Running the command.");
+    assert_eq!(readback.messages[2].tool_calls.len(), 1);
+    assert_eq!(
+        readback.messages[2].tool_calls[0].id.as_deref(),
+        Some("call_a")
+    );
+    assert_eq!(readback.messages[2].tool_calls[0].name, "run_terminal_cmd");
+    assert_eq!(readback.messages[2].tool_results.len(), 1);
+    assert_eq!(readback.messages[2].tool_results[0].content, "hi\n");
+    assert_eq!(
+        readback.messages[3].author.as_deref(),
+        Some("reasoning"),
+        "reasoning author survives via agent_thought_chunk"
+    );
+    assert_eq!(readback.messages[3].content, "Reflecting on the output.");
+    assert_eq!(readback.messages[4].role, MessageRole::Assistant);
+    assert_eq!(readback.messages[4].content, "Done: hi");
+    // System has no native Grok update kind; it collapses to the user bucket
+    // with content preserved (the pipeline verifies role BUCKETS, and
+    // system/tool/user share one bucket).
+    assert_eq!(readback.messages[5].role, MessageRole::User);
+    assert_eq!(readback.messages[5].content, "system note");
+
+    // Metadata: title via summary.json. The foreign (non-grok) model id is
+    // replaced with the default Grok model: summary.json's current_model_id
+    // is REQUIRED for `grok --resume` to load the session (live-bisected on
+    // grok 0.2.118), and a foreign id would confuse model selection.
+    assert_eq!(readback.title.as_deref(), Some("Writer round-trip"));
+    assert_eq!(
+        readback.workspace,
+        Some(PathBuf::from("/data/projects/foo"))
+    );
+    assert_eq!(readback.model_name.as_deref(), Some("grok-4.5"));
 }
 
 /// CLI smoke test: `casr list --provider grok` finds the seeded session.
@@ -229,9 +314,11 @@ fn cli_info_reports_seeded_grok_session() {
     );
 }
 
-/// CLI smoke test: converting INTO grok fails with the read-only message.
+/// CLI e2e: converting INTO grok succeeds and passes the pipeline's
+/// read-back verification (which would fail the run with `VerifyFailed`
+/// if the writer and reader disagreed on the format).
 #[test]
-fn cli_convert_into_grok_is_refused() {
+fn cli_convert_into_grok_succeeds_with_readback_verification() {
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     seed_grok_home(tmp.path());
@@ -251,17 +338,38 @@ fn cli_convert_into_grok_is_refused() {
         .output()
         .expect("run casr resume grok");
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "converting into grok must fail (read-only provider)"
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        output.status.success(),
+        "converting into grok must succeed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
     );
     assert!(
-        combined.contains("read/resume-only"),
-        "expected the read-only refusal message, got:\n{combined}"
+        stdout.contains("grok --resume"),
+        "expected a grok resume command in output:\n{stdout}"
+    );
+
+    // The written session must exist under GROK_HOME as a native tree.
+    let _env = EnvGuard::set("GROK_HOME", tmp.path());
+    let written = Grok.list_sessions().expect("list sessions");
+    assert_eq!(
+        written.len(),
+        2,
+        "seeded fixture + newly written session: {written:?}"
+    );
+    let new_session = written
+        .iter()
+        .find(|(id, _)| id != FIXTURE_ID)
+        .expect("newly written session present");
+    assert!(new_session.1.ends_with("updates.jsonl"));
+    assert!(
+        new_session
+            .1
+            .parent()
+            .unwrap()
+            .join("summary.json")
+            .is_file(),
+        "summary.json written next to updates.jsonl"
     );
 }
