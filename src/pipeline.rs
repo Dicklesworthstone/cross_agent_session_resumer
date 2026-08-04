@@ -94,6 +94,24 @@ impl ValidationResult {
     }
 }
 
+/// Make a user-supplied workspace path absolute.
+///
+/// Cwd-keyed providers (Claude Code) turn the workspace into a path-encoded
+/// bucket name and `--resume` only finds sessions whose bucket matches the
+/// invoking cwd — which is always absolute. A relative `--workspace ./foo`
+/// would therefore write a bucket nothing can match. Existing directories are
+/// canonicalized (resolving `..` and symlinks the same way a shell's cwd is);
+/// anything else is joined onto the current directory and returned as-is.
+pub fn absolutize_workspace(ws: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(ws) {
+        return canonical;
+    }
+    if ws.is_absolute() {
+        return ws.to_path_buf();
+    }
+    std::env::current_dir().map_or_else(|_| ws.to_path_buf(), |cwd| cwd.join(ws))
+}
+
 /// Validate a canonical session for completeness and quality.
 ///
 /// Returns errors (fatal), warnings (non-fatal), and info notes.
@@ -383,8 +401,14 @@ create it before resuming or the target CLI may not find the session.",
                     ws.display()
                 ));
             }
+            // Absolutize: cwd-keyed providers encode the workspace path into a
+            // bucket name and compare it against the resume command's
+            // *absolute* cwd, so a relative `--workspace ./foo` would write a
+            // `--foo` bucket that can never match and silently reproduce the
+            // very unfindable-session bug this flag exists to fix.
+            let ws = absolutize_workspace(ws);
             debug!(workspace = %ws.display(), "workspace explicitly overridden via --workspace");
-            canonical.workspace = Some(ws.clone());
+            canonical.workspace = Some(ws);
         } else if canonical.workspace.is_none() {
             match std::env::current_dir() {
                 Ok(cwd) => {

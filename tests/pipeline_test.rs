@@ -1419,3 +1419,66 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
         "missing read-back verify DEBUG event; got {events:#?}"
     );
 }
+
+/// A relative `--workspace` must be made absolute before it reaches the
+/// writers: Claude Code encodes the workspace into a bucket name and matches it
+/// against the resume command's absolute cwd, so a relative path would write a
+/// bucket nothing can ever match — the same unfindable-session failure the flag
+/// exists to fix (GH #20 follow-up).
+#[test]
+fn pipeline_relative_workspace_override_is_absolutized() {
+    let src = MockProvider::new(
+        "Mock Source",
+        "mock-source",
+        "src",
+        vec![PathBuf::from("/tmp/src-root")],
+    );
+    let dst = MockProvider::new(
+        "Mock Target",
+        "mock-target",
+        "tgt",
+        vec![PathBuf::from("/tmp/tgt-root")],
+    );
+
+    let source_path = PathBuf::from("/tmp/src-root/session-rel.json");
+    let written_path = PathBuf::from("/tmp/tgt-root/session-rel-out.json");
+    let session = valid_session_with_id("sid-rel");
+
+    src.set_owned_session("sid-rel", source_path.clone());
+    src.set_read_session(source_path, session.clone());
+    dst.set_write_success(WrittenSession {
+        paths: vec![written_path.clone()],
+        session_id: "target-sid-rel".to_string(),
+        resume_command: "tgt --resume target-sid-rel".to_string(),
+        backup_path: None,
+        warnings: Vec::new(),
+    });
+    dst.set_read_session(written_path, session.clone());
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(src.clone()), Box::new(dst.clone())]),
+    };
+
+    let mut opts = options(false, None);
+    opts.workspace_override = Some(PathBuf::from("."));
+
+    pipeline
+        .convert("tgt", "sid-rel", opts)
+        .expect("convert with relative workspace override should succeed");
+
+    let written_workspace = dst
+        .last_written()
+        .expect("target should capture written session")
+        .workspace
+        .expect("workspace must be stamped");
+    assert!(
+        written_workspace.is_absolute(),
+        "relative --workspace must be absolutized, got {}",
+        written_workspace.display()
+    );
+    assert_eq!(
+        written_workspace,
+        std::fs::canonicalize(".").expect("canonicalize cwd"),
+        "`.` must resolve to the invoking directory"
+    );
+}
