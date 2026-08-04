@@ -353,10 +353,10 @@ impl Provider for Gemini {
             .ok_or_else(|| anyhow::anyhow!("cannot determine Gemini tmp directory"))?;
 
         // Use workspace hash for project directory, or a fallback hash.
-        let workspace_path = session
-            .workspace
-            .as_deref()
-            .unwrap_or(std::path::Path::new("/tmp"));
+        // Missing workspace falls back to the invoking cwd (never /tmp) so the
+        // session lands in the project bucket the user will resume from.
+        let workspace_buf = crate::model::effective_workspace(session);
+        let workspace_path = workspace_buf.as_path();
         let hash = session
             .metadata
             .get("project_hash")

@@ -323,6 +323,123 @@ fn pipeline_convert_happy_path_writes_and_verifies() {
     );
 }
 
+/// GH #20 regression: a source session with no recorded workspace must fall
+/// back to the invoking cwd (never /tmp) and warn loudly about the cwd-keyed
+/// resume requirement.
+#[test]
+fn pipeline_no_workspace_falls_back_to_cwd_with_loud_warning() {
+    let src = MockProvider::new(
+        "Mock Source",
+        "mock-source",
+        "src",
+        vec![PathBuf::from("/tmp/src-root")],
+    );
+    let dst = MockProvider::new(
+        "Mock Target",
+        "mock-target",
+        "tgt",
+        vec![PathBuf::from("/tmp/tgt-root")],
+    );
+
+    let source_path = PathBuf::from("/tmp/src-root/session-nw.json");
+    let mut session = valid_session_with_id("sid-nw");
+    session.workspace = None;
+
+    src.set_owned_session("sid-nw", source_path.clone());
+    src.set_read_session(source_path, session);
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(src.clone()), Box::new(dst.clone())]),
+    };
+
+    let result = pipeline
+        .convert("tgt", "sid-nw", options(true, None))
+        .expect("dry-run convert should succeed");
+
+    let cwd = std::env::current_dir().expect("cwd");
+    assert_eq!(
+        result.canonical_session.workspace.as_deref(),
+        Some(cwd.as_path()),
+        "missing workspace must fall back to the invoking cwd, not /tmp"
+    );
+    let warning = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("no recorded workspace"))
+        .expect("fallback must produce a loud warning");
+    assert!(
+        warning.contains(&cwd.display().to_string()),
+        "warning must name the fallback directory: {warning}"
+    );
+    assert!(
+        warning.contains("--workspace"),
+        "warning must point at the --workspace escape hatch: {warning}"
+    );
+}
+
+/// GH #20: `--workspace` must override whatever the source session recorded,
+/// and the overridden workspace must be what the writer receives.
+#[test]
+fn pipeline_workspace_override_wins_over_recorded_workspace() {
+    let src = MockProvider::new(
+        "Mock Source",
+        "mock-source",
+        "src",
+        vec![PathBuf::from("/tmp/src-root")],
+    );
+    let dst = MockProvider::new(
+        "Mock Target",
+        "mock-target",
+        "tgt",
+        vec![PathBuf::from("/tmp/tgt-root")],
+    );
+
+    let override_dir = tempfile::TempDir::new().expect("tempdir");
+    let source_path = PathBuf::from("/tmp/src-root/session-ov.json");
+    let written_path = PathBuf::from("/tmp/tgt-root/session-ov-out.json");
+    let session = valid_session_with_id("sid-ov"); // workspace: /tmp/mock-workspace
+
+    src.set_owned_session("sid-ov", source_path.clone());
+    src.set_read_session(source_path, session.clone());
+    dst.set_write_success(WrittenSession {
+        paths: vec![written_path.clone()],
+        session_id: "target-sid-ov".to_string(),
+        resume_command: "tgt --resume target-sid-ov".to_string(),
+        backup_path: None,
+        warnings: Vec::new(),
+    });
+    let mut readback = session.clone();
+    readback.workspace = Some(override_dir.path().to_path_buf());
+    dst.set_read_session(written_path, readback);
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(src.clone()), Box::new(dst.clone())]),
+    };
+
+    let mut opts = options(false, None);
+    opts.workspace_override = Some(override_dir.path().to_path_buf());
+
+    let result = pipeline
+        .convert("tgt", "sid-ov", opts)
+        .expect("convert with workspace override should succeed");
+
+    assert_eq!(
+        dst.last_written()
+            .expect("target should capture written session")
+            .workspace
+            .as_deref(),
+        Some(override_dir.path()),
+        "writer must receive the overridden workspace"
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("no recorded workspace")),
+        "explicit override must not trigger the fallback warning"
+    );
+}
+
 #[test]
 fn pipeline_dry_run_skips_write() {
     let src = MockProvider::new(

@@ -94,6 +94,14 @@ enum Command {
         /// hidden reasoning).
         #[arg(long)]
         keep_reasoning: bool,
+
+        /// Workspace/project directory to stamp into the target session.
+        /// Overrides the source session's recorded workspace. Cwd-keyed
+        /// providers (e.g. Claude Code) only find the session when the resume
+        /// command runs from this directory. When the source session has no
+        /// workspace and this flag is absent, casr uses the current directory.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<std::path::PathBuf>,
     },
 
     /// List all discoverable sessions across installed providers.
@@ -269,6 +277,7 @@ fn main() -> ExitCode {
             max_context_tokens,
             max_tool_output,
             keep_reasoning,
+            workspace,
         } => cmd_resume(
             &target,
             &session_id,
@@ -279,6 +288,7 @@ fn main() -> ExitCode {
             max_context_tokens,
             max_tool_output,
             keep_reasoning,
+            workspace,
             cli.json,
         ),
         Command::List {
@@ -357,6 +367,7 @@ fn cmd_resume(
     max_context_tokens: usize,
     max_tool_output: usize,
     keep_reasoning: bool,
+    workspace: Option<std::path::PathBuf>,
     json_mode: bool,
 ) -> anyhow::Result<()> {
     let registry = ProviderRegistry::default_registry();
@@ -371,6 +382,7 @@ fn cmd_resume(
         max_context_tokens,
         max_tool_output,
         keep_reasoning,
+        workspace_override: workspace,
     };
 
     let result = pipeline.convert(target, session_id, opts)?;

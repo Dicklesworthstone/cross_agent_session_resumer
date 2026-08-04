@@ -103,6 +103,20 @@ pub struct ToolResult {
 // Helpers — ported/adapted from CASS connectors/mod.rs
 // ---------------------------------------------------------------------------
 
+/// Resolve the workspace a writer should stamp into the target session.
+///
+/// Prefers the session's recorded workspace. When the source session recorded
+/// none, falls back to the directory casr was invoked from — NEVER `/tmp`.
+/// Cwd-keyed providers (e.g. Claude Code buckets sessions under a path-encoded
+/// project directory and `claude --resume` only finds sessions whose bucket
+/// matches the *current* cwd) would otherwise write the session somewhere the
+/// user will never resume from.
+pub fn effective_workspace(session: &CanonicalSession) -> std::path::PathBuf {
+    session.workspace.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    })
+}
+
 /// Flatten heterogeneous content representations into a single string.
 ///
 /// Handles all content shapes encountered across providers:

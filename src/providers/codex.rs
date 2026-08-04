@@ -262,10 +262,9 @@ impl Provider for Codex {
         let mut lines: Vec<String> = Vec::with_capacity(session.messages.len() + 1);
 
         // 1. session_meta line.
-        let cwd = session
-            .workspace
-            .as_deref()
-            .unwrap_or(std::path::Path::new("/tmp"))
+        // Missing workspace falls back to the invoking cwd (never /tmp) so the
+        // resumed thread points at the directory the user actually works in.
+        let cwd = crate::model::effective_workspace(session)
             .to_string_lossy()
             .to_string();
 

@@ -38,6 +38,12 @@ pub struct ConvertOptions {
     /// Keep source-agent reasoning traces (dropped by default for cross-agent
     /// handoffs since the target agent cannot use another agent's hidden reasoning).
     pub keep_reasoning: bool,
+    /// Explicit workspace/project directory for the target session. Overrides
+    /// whatever the source session recorded (or failed to record). Cwd-keyed
+    /// providers (e.g. Claude Code) resolve sessions by matching the resume
+    /// command's cwd against the session's workspace bucket, so getting this
+    /// right is what makes `--resume` actually find the session.
+    pub workspace_override: Option<std::path::PathBuf>,
 }
 
 impl Default for ConvertOptions {
@@ -52,6 +58,7 @@ impl Default for ConvertOptions {
             max_context_tokens: 0,
             max_tool_output: 0,
             keep_reasoning: true,
+            workspace_override: None,
         }
     }
 }
@@ -114,7 +121,9 @@ pub fn validate_session(session: &CanonicalSession) -> ValidationResult {
     // WARNINGS — conversion continues.
     if session.workspace.is_none() {
         result.warnings.push(
-            "Session has no workspace. Target agent may not know which project to work in."
+            "Session has no workspace. Target agent may not know which project to work in, \
+and cwd-keyed providers (e.g. Claude Code) will only find the session when resumed from \
+the directory stamped into it. Use --workspace <path> to set it explicitly."
                 .to_string(),
         );
     }
@@ -357,6 +366,45 @@ but resume may fail until the CLI is installed.",
             session_id = canonical.session_id,
             "source session read"
         );
+
+        // 3b. Resolve the target workspace BEFORE validation/write.
+        //
+        // Cwd-keyed providers (e.g. Claude Code) bucket sessions by a
+        // path-encoded workspace directory and `--resume` only finds sessions
+        // whose bucket matches the invoking cwd. Silently defaulting a missing
+        // workspace to `/tmp` (the old behavior) produced sessions that
+        // "converted fine" but could never be resumed from the real project
+        // directory (GH #20).
+        if let Some(ws) = &opts.workspace_override {
+            if !ws.is_dir() {
+                all_warnings.push(format!(
+                    "--workspace {} does not exist (or is not a directory). Using it anyway; \
+create it before resuming or the target CLI may not find the session.",
+                    ws.display()
+                ));
+            }
+            debug!(workspace = %ws.display(), "workspace explicitly overridden via --workspace");
+            canonical.workspace = Some(ws.clone());
+        } else if canonical.workspace.is_none() {
+            match std::env::current_dir() {
+                Ok(cwd) => {
+                    all_warnings.push(format!(
+                        "Session has no recorded workspace; defaulting to the current directory \
+{cwd_display}. The target CLI resolves sessions by cwd, so run the resume command FROM \
+{cwd_display} — or re-run with --workspace <path> to target the real project directory.",
+                        cwd_display = cwd.display()
+                    ));
+                    canonical.workspace = Some(cwd);
+                }
+                Err(err) => {
+                    all_warnings.push(format!(
+                        "Session has no recorded workspace and the current directory could not be \
+determined ({err}). Re-run with --workspace <path>; otherwise the target CLI may not find the \
+session unless your cwd matches the written workspace."
+                    ));
+                }
+            }
+        }
 
         // 4. Validate.
         let validation = validate_session(&canonical);

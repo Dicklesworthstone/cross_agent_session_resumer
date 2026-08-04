@@ -303,6 +303,53 @@ fn writer_cc_workspace_directory_placement() {
     );
 }
 
+/// GH #20 regression: a session with no recorded workspace must NOT be
+/// bucketed under `/tmp` (path-encoded `-tmp`). Claude Code resolves
+/// `--resume` by matching the invoking cwd against the session's bucket, so
+/// the fallback must be the directory casr runs from.
+#[test]
+fn writer_cc_no_workspace_falls_back_to_cwd_not_tmp() {
+    let _lock = CC_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAUDE_HOME", tmp.path());
+
+    let mut session = simple_session();
+    session.workspace = None;
+
+    let written = ClaudeCode
+        .write_session(&session, &WriteOptions { force: false })
+        .unwrap();
+
+    let path = &written.paths[0];
+    let parent = path.parent().unwrap();
+    let bucket = parent.file_name().unwrap().to_string_lossy().to_string();
+    assert_ne!(
+        bucket, "-tmp",
+        "no-workspace session must not land in the /tmp bucket"
+    );
+
+    // The bucket must be derived from the invoking cwd, not /tmp.
+    let cwd = std::env::current_dir().unwrap();
+    let expected_bucket = casr::providers::claude_code::project_dir_key(&cwd);
+    assert_eq!(
+        bucket,
+        expected_bucket,
+        "bucket should encode the invoking cwd ({}), got: {bucket}",
+        cwd.display()
+    );
+
+    // Every entry's cwd field must be the invoking cwd, not /tmp.
+    let content = std::fs::read_to_string(path).unwrap();
+    for (i, line) in content.lines().enumerate() {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            entry["cwd"].as_str().unwrap(),
+            cwd.display().to_string(),
+            "CC line {i}: cwd must be the invoking directory, not /tmp"
+        );
+    }
+}
+
 #[test]
 fn writer_cc_timestamps_are_rfc3339() {
     let _lock = CC_ENV.lock().unwrap();
@@ -1145,7 +1192,7 @@ fn writer_gemini_project_hash_matches_workspace() {
 // ===========================================================================
 
 #[test]
-fn writer_cc_default_workspace_uses_tmp() {
+fn writer_cc_default_workspace_uses_invoking_cwd() {
     let _lock = CC_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLAUDE_HOME", tmp.path());
@@ -1159,14 +1206,17 @@ fn writer_cc_default_workspace_uses_tmp() {
 
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     let first: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    // GH #20: falling back to /tmp broke `claude --resume` (cwd-keyed lookup).
     assert_eq!(
-        first["cwd"], "/tmp",
-        "CC should fall back to /tmp when workspace is None"
+        first["cwd"],
+        cwd.display().to_string().as_str(),
+        "CC should fall back to the invoking cwd (not /tmp) when workspace is None"
     );
 }
 
 #[test]
-fn writer_codex_default_workspace_uses_tmp() {
+fn writer_codex_default_workspace_uses_invoking_cwd() {
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CODEX_HOME", tmp.path());
@@ -1180,9 +1230,12 @@ fn writer_codex_default_workspace_uses_tmp() {
 
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     let first: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    // GH #20: falling back to /tmp broke resume for cwd-keyed providers.
     assert_eq!(
-        first["payload"]["cwd"], "/tmp",
-        "Codex should fall back to /tmp when workspace is None"
+        first["payload"]["cwd"],
+        cwd.display().to_string().as_str(),
+        "Codex should fall back to the invoking cwd (not /tmp) when workspace is None"
     );
 }
 
