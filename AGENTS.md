@@ -60,7 +60,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 | Crate | Purpose |
 |-------|---------|
-| `clap` + `clap_complete` | CLI argument parsing and shell completions (`casr <target> resume <session-id>`) |
+| `clap` + `clap_complete` | CLI argument parsing and shell completions (`casr resume <target> <session-id>`) |
 | `serde` + `serde_json` | Canonical session model + provider format parsing/writing |
 | `anyhow` + `thiserror` | Internal propagation + actionable user-facing errors |
 | `chrono` | Timestamp normalization (ISO-8601, epoch seconds/millis) |
@@ -559,7 +559,7 @@ casr runs in interactive CLI loops, so latency matters:
 casr is a command-line tool (not a hook protocol). Primary command shape:
 
 ```bash
-casr <target> resume <session-id> [--source <alias_or_path>] [--dry-run] [--force] [--json] [--verbose|--trace] [--enrich]
+casr resume <target> <session-id> [--source <alias_or_path>] [--dry-run] [--force] [--json] [--verbose|--trace] [--enrich]
 ```
 
 Additional command shapes:

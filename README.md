@@ -28,7 +28,7 @@ That installer is the primary distribution path. It handles platform detection, 
 
 | Feature | What It Does |
 |---|---|
-| Cross-provider resume | `casr cc resume <codex-session-id>` and similar conversions in one command |
+| Cross-provider resume | `casr resume cc <codex-session-id>` and similar conversions in one command |
 | Canonical IR | Normalizes provider formats into a common model, then exports back to native format |
 | Native-format writers | Produces plausible provider-native session files, not intermediate-only exports |
 | Safety-first writes | Atomic temp-then-rename writes, conflict detection, optional `.bak` backup with `--force` |
@@ -50,7 +50,7 @@ casr list --limit 20 --sort date
 casr info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
 # 4) Convert that session to Claude Code format
-casr cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+casr resume cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
 # ergonomic shorthand (auto-detects source provider from the session ID)
 casr -cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # open in Claude Code
@@ -216,19 +216,19 @@ Global flags:
 --enrich                  # Add optional synthetic context/orientation messages
 ```
 
-### `casr <target> resume <session-id>`
+### `casr resume <target> <session-id>`
 
 Convert a source session into target provider format and print the target resume command.
 
 ```bash
-casr cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
-casr claude resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # standard name fallback
-casr cod resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
-casr codex resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
-casr gmi resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
-casr gemini resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
-casr cc resume <session-id> --force
-casr cc resume <session-id> --json
+casr resume cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+casr resume claude 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # standard name fallback
+casr resume cod 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
+casr resume codex 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
+casr resume gmi 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
+casr resume gemini 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
+casr resume cc <session-id> --force
+casr resume cc <session-id> --json
 ```
 
 ### `casr list`
@@ -331,7 +331,7 @@ Important helpers:
 
 ```text
 Input CLI
-  casr <target> resume <session-id>
+  casr resume <target> <session-id>
           |
           v
 Provider Registry + Detection
@@ -390,7 +390,7 @@ Common examples:
 
 `casr` supports two equivalent resume styles:
 
-- Canonical subcommand form: `casr <target> resume <session-id>`
+- Canonical subcommand form: `casr resume <target> <session-id>`
 - Shorthand form: `casr -cc <session-id>`, `casr -cod <session-id>`, `casr -agy <session-id>`, `casr -gmi <session-id>`
 
 Shorthand flags are rewritten internally before clap parsing, so logging, JSON output, and error handling stay identical across both forms.
@@ -530,7 +530,7 @@ Recommended test set for new providers:
 
 - Reader and writer unit tests for native fixtures.
 - Round-trip tests (`read(write(read(...)))`).
-- CLI integration test path through `casr list`, `casr info`, and `casr <target> resume`.
+- CLI integration test path through `casr list`, `casr info`, and `casr resume <target>`.
 - Error-path tests for malformed input and file I/O failures.
 
 ## Provider Format Notes
@@ -637,7 +637,7 @@ Test suite coverage includes:
 ```bash
 casr list
 casr info <session-id>
-casr cc resume <session-id> --source cod
+casr resume cc <session-id> --source cod
 ```
 
 ### "Target provider not installed"
@@ -655,7 +655,7 @@ Install the missing provider, then retry.
 Use force mode to back up and overwrite:
 
 ```bash
-casr cc resume <session-id> --force
+casr resume cc <session-id> --force
 ```
 
 ### "Write verification failed"
@@ -663,7 +663,7 @@ casr cc resume <session-id> --force
 Run in trace mode and inspect JSON diagnostics:
 
 ```bash
-casr cc resume <session-id> --trace --json
+casr resume cc <session-id> --trace --json
 ```
 
 ### "Wrong source provider was detected"
@@ -671,8 +671,8 @@ casr cc resume <session-id> --trace --json
 Pin source provider or session path explicitly:
 
 ```bash
-casr cc resume <session-id> --source cod
-casr cc resume <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.jsonl
+casr resume cc <session-id> --source cod
+casr resume cc <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.jsonl
 ```
 
 ## Limitations

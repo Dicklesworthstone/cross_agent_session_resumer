@@ -118,7 +118,7 @@ All 14 providers were implemented via a pluggable `Provider` trait with `detect`
 
 ### CLI and UX
 
-- **Subcommand and shorthand resume**: both `casr <target> resume <id>` and `casr -cc <id>` / `casr -cod <id>` / `casr -gmi <id>` forms supported; shorthand flags rewritten internally before clap parsing ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c)).
+- **Subcommand and shorthand resume**: both `casr resume <target> <id>` and `casr -cc <id>` / `casr -cod <id>` / `casr -gmi <id>` forms supported; shorthand flags rewritten internally before clap parsing ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c)).
 - **Rich terminal table for `casr list`**: styled columns for provider, session ID, workspace, message count, tool-use count, and relative last-active age ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c), [`dc16517`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/dc16517ae34d9877f6c2bfb44a81b58bf59ff0d9)).
 - **Workspace-scoped list**: `casr list` defaults to sessions from the current working directory; `--workspace` overrides explicitly ([`474e765`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/474e765f6cb2d7907e83c9aab631211930ed9442)).
 - **Standard provider name aliases**: `claude` -> `claude-code`, `codex-cli` -> `codex`, `gemini-cli` -> `gemini` for natural command invocation ([`80c5789`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/80c5789d06770aca4d571ffe3e1cc070b58d7440)).
