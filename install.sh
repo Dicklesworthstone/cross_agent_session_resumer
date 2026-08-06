@@ -435,7 +435,7 @@ casr -gmi <session-id>  # open in Gemini
 ```bash
 casr providers
 casr list --workspace "$(pwd)" --sort date --limit 20
-casr cod resume <session-id> --source cc
+casr resume cod <session-id> --source cc
 casr info <session-id> --json
 ```
 

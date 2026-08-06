@@ -180,7 +180,7 @@ impl ProviderRegistry {
 
     /// Resolve a session ID to its source provider and file path.
     ///
-    /// This is the main entry point for the `casr <target> resume <session-id>`
+    /// This is the main entry point for the `casr resume <target> <session-id>`
     /// flow. It implements a deterministic multi-step algorithm:
     ///
     /// 1. If `source_hint` is a [`SourceHint::Path`], bypass discovery entirely.

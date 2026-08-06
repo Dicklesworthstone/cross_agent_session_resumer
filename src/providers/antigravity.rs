@@ -334,7 +334,7 @@ impl Provider for Antigravity {
         Err(anyhow::anyhow!(
             "Antigravity (agy) is read/resume-only: casr cannot create a resumable \
              agy conversation from another provider's history. Use agy as a conversion \
-             SOURCE (e.g. `casr cc resume <agy-uuid> --source agy`), not a target."
+             SOURCE (e.g. `casr resume cc <agy-uuid> --source agy`), not a target."
         ))
     }
 
