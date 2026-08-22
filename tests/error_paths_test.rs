@@ -179,6 +179,18 @@ mod unix_error_paths {
     // Read unreadable (permission denied) — CC, Codex, Gemini
     // =========================================================================
 
+    /// True when permission bits are enforced for this process. root (and
+    /// some filesystems) can read 0o000 files and write into 0o555 dirs;
+    /// the tests below then have a false premise and skip instead of
+    /// failing falsely. Probe artifacts live in the test's TempDir.
+    fn unreadable_file_is_enforced(file: &std::path::Path) -> bool {
+        fs::File::open(file).is_err()
+    }
+
+    fn readonly_dir_is_enforced(dir: &std::path::Path) -> bool {
+        fs::write(dir.join(".readonly-probe"), b"probe").is_err()
+    }
+
     #[test]
     fn read_unreadable_cc_session_file_returns_error() {
         let _lock = CC_ENV.lock().unwrap();
@@ -199,6 +211,10 @@ mod unix_error_paths {
         fs::copy(&src, &target_file).unwrap();
 
         fs::set_permissions(&target_file, fs::Permissions::from_mode(0o000)).unwrap();
+        if !unreadable_file_is_enforced(&target_file) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: target_file.clone(),
             mode: 0o644,
@@ -233,6 +249,10 @@ mod unix_error_paths {
         fs::copy(&src, &target_file).unwrap();
 
         fs::set_permissions(&target_file, fs::Permissions::from_mode(0o000)).unwrap();
+        if !unreadable_file_is_enforced(&target_file) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: target_file.clone(),
             mode: 0o644,
@@ -263,6 +283,10 @@ mod unix_error_paths {
         .unwrap();
 
         fs::set_permissions(&session_file, fs::Permissions::from_mode(0o000)).unwrap();
+        if !unreadable_file_is_enforced(&session_file) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: session_file.clone(),
             mode: 0o644,
@@ -383,6 +407,10 @@ mod unix_error_paths {
         let sessions_dir = tmp.path().join("sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(&sessions_dir) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: sessions_dir,
             mode: 0o755,
@@ -405,6 +433,10 @@ mod unix_error_paths {
 
         // ClawdBot writes directly under HOME — make the home dir read-only.
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(tmp.path()) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
@@ -427,6 +459,10 @@ mod unix_error_paths {
 
         // Vibe writes to <HOME>/<session-id>/messages.jsonl — make home read-only.
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(tmp.path()) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
@@ -449,6 +485,10 @@ mod unix_error_paths {
 
         // Factory writes to <HOME>/<workspace-hash>/ — make home read-only.
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(tmp.path()) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
@@ -471,6 +511,10 @@ mod unix_error_paths {
 
         // OpenClaw writes directly under HOME — make home read-only.
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(tmp.path()) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
@@ -494,6 +538,10 @@ mod unix_error_paths {
         let sessions_dir = tmp.path().join("sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(&sessions_dir) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: sessions_dir,
             mode: 0o755,

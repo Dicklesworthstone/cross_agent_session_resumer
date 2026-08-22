@@ -203,6 +203,15 @@ mod atomic_write_integration {
     // Write to read-only directory fails gracefully — core providers
     // =====================================================================
 
+    /// True when permission bits are actually enforced for this process.
+    /// root (and some filesystems) can write into 0o555 directories; the
+    /// read-only premise of these tests does not hold there, so they skip
+    /// instead of failing falsely. The probe file, if created, lives in the
+    /// test's TempDir and is removed with it.
+    fn readonly_dir_is_enforced(dir: &std::path::Path) -> bool {
+        fs::write(dir.join(".readonly-probe"), b"probe").is_err()
+    }
+
     #[test]
     fn codex_write_to_readonly_dir_returns_error() {
         let _lock = CODEX_ENV.lock().unwrap();
@@ -212,6 +221,10 @@ mod atomic_write_integration {
         let sessions_dir = tmp.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
         fs::set_permissions(&sessions_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(&sessions_dir) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: sessions_dir,
             mode: 0o755,
@@ -235,6 +248,10 @@ mod atomic_write_integration {
         let projects_dir = tmp.path().join("projects");
         fs::create_dir_all(&projects_dir).expect("create projects dir");
         fs::set_permissions(&projects_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(&projects_dir) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: projects_dir,
             mode: 0o755,
@@ -258,6 +275,10 @@ mod atomic_write_integration {
         let gemini_dir = tmp.path().join("tmp");
         fs::create_dir_all(&gemini_dir).expect("create gemini dir");
         fs::set_permissions(&gemini_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if !readonly_dir_is_enforced(&gemini_dir) {
+            eprintln!("skipping: permission bits not enforced here (running as root?)");
+            return;
+        }
         let _guard = PermGuard {
             path: gemini_dir,
             mode: 0o755,
