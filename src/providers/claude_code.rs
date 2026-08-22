@@ -193,6 +193,7 @@ impl Provider for ClaudeCode {
         let mut custom_title: Option<String> = None;
         let mut ai_title: Option<String> = None;
         let mut summary_title: Option<String> = None;
+        let mut away_summary: Option<String> = None;
         let mut started_at: Option<i64> = None;
         let mut ended_at: Option<i64> = None;
         let mut model_counts: std::collections::HashMap<String, usize> =
@@ -270,6 +271,18 @@ impl Provider for ClaudeCode {
                 Some("summary") => {
                     if let Some(t) = entry.get("summary").and_then(|v| v.as_str()) {
                         summary_title = Some(t.to_string());
+                    }
+                }
+                Some("system") => {
+                    // Claude Code writes a running recap of the session as
+                    // `system`/`away_summary` entries. The last one is the
+                    // freshest description and doubles as a title for
+                    // sessions that never received a title entry.
+                    if entry.get("subtype").and_then(|v| v.as_str()) == Some("away_summary")
+                        && let Some(content) = entry.get("content").and_then(|v| v.as_str())
+                        && let Some(description) = away_summary_description(content)
+                    {
+                        away_summary = Some(description);
                     }
                 }
                 _ => {}
@@ -350,11 +363,22 @@ impl Provider for ClaudeCode {
                 .to_string()
         });
 
-        // Derive title from first user message.
-        let title = messages
+        // Derive title: prefer the latest away_summary recap — a session that
+        // opens with a slash command otherwise gets titled with the
+        // `<local-command-caveat>` harness chrome. The user-message fallback
+        // skips chrome-only messages for the same reason, keeping the plain
+        // first user message as the last resort.
+        let first_user_title = messages
             .iter()
-            .find(|m| m.role == MessageRole::User)
+            .filter(|m| m.role == MessageRole::User)
+            .find(|m| !is_harness_chrome(&m.content))
+            .or_else(|| messages.iter().find(|m| m.role == MessageRole::User))
             .map(|m| truncate_title(&m.content, 100));
+        let title = away_summary
+            .as_deref()
+            .map(|s| truncate_title(s, 100))
+            .filter(|s| !s.is_empty())
+            .or(first_user_title);
 
         // Most common model name.
         let model_name = model_counts
@@ -375,10 +399,12 @@ impl Provider for ClaudeCode {
             metadata.insert("claudeVersion".into(), serde_json::Value::String(v.clone()));
         }
         // Provider-native display name: user `/rename` wins, then the
-        // auto-generated title, then a classic summary. Blank values are ignored.
+        // auto-generated title, then a classic summary, then the latest
+        // away_summary recap. Blank values are ignored.
         let native_name = custom_title
             .or(ai_title)
             .or(summary_title)
+            .or(away_summary)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         if let Some(name) = native_name {
@@ -686,6 +712,35 @@ fn build_inner_message(
         });
     }
     inner_msg
+}
+
+/// Trailing UI hint Claude Code appends to `away_summary` recap entries. It
+/// is terminal chrome, not part of the session description.
+const AWAY_SUMMARY_HINT: &str = "(disable recaps in /config)";
+
+/// The descriptive text of an `away_summary` entry, or `None` when nothing
+/// remains once surrounding whitespace and the trailing UI hint are removed.
+fn away_summary_description(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    let body = trimmed
+        .strip_suffix(AWAY_SUMMARY_HINT)
+        .unwrap_or(trimmed)
+        .trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+/// True for user messages that are Claude Code harness chrome (local-command
+/// caveats and slash-command echoes) rather than something a person typed.
+fn is_harness_chrome(content: &str) -> bool {
+    let t = content.trim_start();
+    [
+        "<local-command-caveat>",
+        "<command-name>",
+        "<command-message>",
+        "<local-command-stdout>",
+    ]
+    .iter()
+    .any(|tag| t.starts_with(tag))
 }
 
 fn claude_session_id_hint(path: &Path) -> Option<String> {
@@ -1011,6 +1066,85 @@ not json at all
         assert!(
             crate::model::native_name_from_metadata(&session.metadata).is_none(),
             "sessions without title metadata must have no native name"
+        );
+    }
+
+    #[test]
+    fn reader_away_summary_titles_session_over_command_caveat() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"as1","message":{"role":"user","content":"<local-command-caveat>Caveat: local commands</local-command-caveat>"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"Wiring the payments webhook retries","sessionId":"as1","timestamp":"2026-01-01T01:00:00Z"}
+{"type":"assistant","sessionId":"as1","message":{"role":"assistant","content":"ok"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
+        );
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Wiring the payments webhook retries")
+        );
+        assert_eq!(
+            crate::model::native_name_from_metadata(&session.metadata).as_deref(),
+            Some("Wiring the payments webhook retries")
+        );
+    }
+
+    #[test]
+    fn reader_away_summary_last_entry_wins_and_hint_is_stripped() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"as2","message":{"role":"user","content":"go"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"Early recap","sessionId":"as2","timestamp":"2026-01-01T00:30:00Z"}
+{"type":"system","subtype":"away_summary","content":"Final recap of the session. (disable recaps in /config)","sessionId":"as2","timestamp":"2026-01-01T01:00:00Z"}
+{"type":"assistant","sessionId":"as2","message":{"role":"assistant","content":"ok"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}"#,
+        );
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Final recap of the session.")
+        );
+    }
+
+    #[test]
+    fn reader_hint_only_away_summary_does_not_shadow_fallback() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"as3","message":{"role":"user","content":"Investigate flaky CI"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"  (disable recaps in /config)","sessionId":"as3","timestamp":"2026-01-01T01:00:00Z"}"#,
+        );
+        assert_eq!(session.title.as_deref(), Some("Investigate flaky CI"));
+    }
+
+    #[test]
+    fn reader_custom_title_beats_away_summary_for_native_name() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"as4","message":{"role":"user","content":"do"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"system","subtype":"away_summary","content":"A recap","sessionId":"as4","timestamp":"2026-01-01T00:30:00Z"}
+{"type":"custom-title","customTitle":"Renamed By Hand","sessionId":"as4"}"#,
+        );
+        assert_eq!(
+            crate::model::native_name_from_metadata(&session.metadata).as_deref(),
+            Some("Renamed By Hand")
+        );
+    }
+
+    #[test]
+    fn reader_title_fallback_skips_harness_chrome_user_messages() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"as5","message":{"role":"user","content":"<local-command-caveat>Caveat: local commands</local-command-caveat>"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"user","sessionId":"as5","message":{"role":"user","content":"<command-name>/effort</command-name>"},"uuid":"u2","timestamp":"2026-01-01T00:00:01Z"}
+{"type":"user","sessionId":"as5","message":{"role":"user","content":"Fix the login redirect loop"},"uuid":"u3","timestamp":"2026-01-01T00:00:02Z"}"#,
+        );
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Fix the login redirect loop")
+        );
+    }
+
+    #[test]
+    fn reader_all_chrome_user_messages_fall_back_to_first() {
+        let session = read_cc_jsonl(
+            r#"{"type":"user","sessionId":"as6","message":{"role":"user","content":"<local-command-caveat>Caveat: local commands</local-command-caveat>"},"uuid":"u1","timestamp":"2026-01-01T00:00:00Z"}"#,
+        );
+        assert!(
+            session
+                .title
+                .as_deref()
+                .is_some_and(|t| t.starts_with("<local-command-caveat>"))
         );
     }
 
