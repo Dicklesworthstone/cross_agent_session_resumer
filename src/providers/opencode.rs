@@ -143,6 +143,14 @@ impl OpenCode {
         }
 
         if let Some(workspace) = &session.workspace {
+            // Discovery builds its candidates from `current_dir()`, which
+            // resolves symlinks (macOS spells `/var/...` cwds as
+            // `/private/var/...`). Canonicalize so the DB this write creates
+            // is the very path discovery will report; otherwise the same
+            // session round-trips under two spellings that compare unequal.
+            let workspace = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.clone());
             return Ok(workspace.join(DATA_DIRNAME).join(DB_FILENAME));
         }
 
@@ -1022,7 +1030,17 @@ mod tests {
         assert_eq!(readback.messages[0].content, source.messages[0].content);
         assert_eq!(readback.messages[1].role, MessageRole::Assistant);
         assert_eq!(readback.messages[1].content, source.messages[1].content);
-        assert_eq!(readback.workspace.as_deref(), Some(workspace.as_path()));
+        // The writer canonicalizes the workspace so the DB it creates is the
+        // same file discovery reports; the round trip therefore preserves the
+        // *directory*, not the byte spelling (macOS: `/var` vs `/private/var`).
+        assert_eq!(
+            readback
+                .workspace
+                .as_deref()
+                .and_then(|w| w.canonicalize().ok()),
+            workspace.canonicalize().ok(),
+            "round trip should preserve the workspace directory"
+        );
         // The target id is now derived stably from the source session id so that
         // re-conversion is idempotent and `--force` can overwrite in place.
         assert_eq!(readback.session_id, source.session_id);

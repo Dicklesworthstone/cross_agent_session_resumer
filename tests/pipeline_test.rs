@@ -423,12 +423,17 @@ fn pipeline_workspace_override_wins_over_recorded_workspace() {
         .convert("tgt", "sid-ov", opts)
         .expect("convert with workspace override should succeed");
 
+    // `absolutize_workspace` deliberately canonicalizes an existing override
+    // before it reaches the writer, so the expectation must go through the
+    // same normalization; on macOS the tempdir's raw spelling (`/var/...`)
+    // differs from the canonical one (`/private/var/...`).
+    let expected_workspace = casr::pipeline::absolutize_workspace(override_dir.path());
     assert_eq!(
         dst.last_written()
             .expect("target should capture written session")
             .workspace
             .as_deref(),
-        Some(override_dir.path()),
+        Some(expected_workspace.as_path()),
         "writer must receive the overridden workspace"
     );
     assert!(
