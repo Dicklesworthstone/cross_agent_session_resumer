@@ -387,6 +387,154 @@ fn cli_list_limit_applies_per_provider() {
     }
 }
 
+/// Collect `session_id` values from a `list --json` invocation's stdout.
+fn session_ids_from_json(output: &std::process::Output) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("list --json should emit valid JSON");
+    parsed["items"]
+        .as_array()
+        .expect("list --json items should be an array")
+        .iter()
+        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn cli_list_all_lists_sessions_from_other_workspaces() {
+    let tmp = TempDir::new().unwrap();
+    let myapp_id = setup_cc_fixture(&tmp, "cc_simple"); // /data/projects/myapp
+    let webapp_id = setup_cc_fixture(&tmp, "cc_complex"); // /data/projects/webapp
+
+    // The default scope is the cwd, which matches neither fixture workspace.
+    let scoped = casr_cmd(&tmp)
+        .args(["--json", "list"])
+        .output()
+        .expect("list should run");
+    assert!(scoped.status.success());
+    let scoped_ids = session_ids_from_json(&scoped);
+    assert!(
+        !scoped_ids.contains(&myapp_id) && !scoped_ids.contains(&webapp_id),
+        "cwd-scoped list must not surface other workspaces, got {scoped_ids:?}"
+    );
+
+    // `--all` lifts the workspace scope entirely.
+    let all = casr_cmd(&tmp)
+        .args(["--json", "list", "--all"])
+        .output()
+        .expect("list --all should run");
+    assert!(all.status.success());
+    let all_ids = session_ids_from_json(&all);
+    assert!(
+        all_ids.contains(&myapp_id),
+        "expected the myapp session under --all, got {all_ids:?}"
+    );
+    assert!(
+        all_ids.contains(&webapp_id),
+        "expected the webapp session under --all, got {all_ids:?}"
+    );
+}
+
+#[test]
+fn cli_list_all_rejects_workspace_flag() {
+    let tmp = TempDir::new().unwrap();
+    let output = casr_cmd(&tmp)
+        .args(["list", "--all", "--workspace", "/data/projects/myapp"])
+        .output()
+        .expect("list should run");
+    assert!(
+        !output.status.success(),
+        "--all combined with --workspace must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict error, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_list_limit_zero_lifts_the_per_provider_cap() {
+    let tmp = TempDir::new().unwrap();
+    // 12 sessions in one workspace: more than the default limit of 10.
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        ids.push(setup_cc_fixture_custom(
+            &tmp,
+            "cc_simple",
+            Some("/data/projects/myapp"),
+            Some(&format!("aaaaaaaa-0000-4000-8000-limitzero{i:03}")),
+        ));
+    }
+
+    let capped = casr_cmd(&tmp)
+        .args(["--json", "list", "--workspace", "/data/projects/myapp"])
+        .output()
+        .expect("list should run");
+    assert!(capped.status.success());
+    assert_eq!(
+        session_ids_from_json(&capped).len(),
+        10,
+        "the default limit should cap at 10"
+    );
+
+    let unlimited = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            "/data/projects/myapp",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .expect("list --limit 0 should run");
+    assert!(unlimited.status.success());
+    let unlimited_ids = session_ids_from_json(&unlimited);
+    assert_eq!(
+        unlimited_ids.len(),
+        ids.len(),
+        "--limit 0 should return every session, got {unlimited_ids:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_list_workspace_matches_symlink_spelling() {
+    let tmp = TempDir::new().unwrap();
+    // The session was recorded under the real directory; the filter names a
+    // symlink to it. The spellings must reconcile (on macOS the same class of
+    // divergence happens implicitly: /var vs /private/var).
+    let real_ws = tmp.path().join("real-ws");
+    std::fs::create_dir_all(&real_ws).unwrap();
+    let link_ws = tmp.path().join("link-ws");
+    std::os::unix::fs::symlink(&real_ws, &link_ws).unwrap();
+
+    let recorded = real_ws.to_string_lossy().to_string();
+    let session_id = setup_cc_fixture_custom(
+        &tmp,
+        "cc_simple",
+        Some(&recorded),
+        Some("bbbbbbbb-0000-4000-8000-symlinkspell"),
+    );
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "list",
+            "--workspace",
+            link_ws.to_str().expect("utf-8 temp path"),
+        ])
+        .output()
+        .expect("list should run");
+    assert!(output.status.success());
+    let ids = session_ids_from_json(&output);
+    assert!(
+        ids.contains(&session_id),
+        "a symlink spelling of the workspace must match the recorded one, got {ids:?}"
+    );
+}
+
 #[test]
 fn cli_list_workspace_filter_filters_sessions() {
     let tmp = TempDir::new().unwrap();
