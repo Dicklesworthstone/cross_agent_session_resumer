@@ -6,6 +6,26 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ---
 
+## [v0.4.0] -- 2026-08-23
+
+Minor release. Tag + GitHub Release (linux x86_64 musl binary) + crates.io.
+
+### Added
+
+- **Session titles from Claude Code away-summary recaps**: sessions with no explicit title now derive one from `away_summary` entries (verified against 1,427 real transcripts), with the `"(disable recaps in /config)"` hint stripped; the title fallback also skips harness-chrome user messages ([`54a065a`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/54a065a)). Reimplements the idea from PR [#22](https://github.com/Dicklesworthstone/cross_agent_session_resumer/pull/22).
+- **`casr list --all` and unlimited `--limit 0`**: `--all` lists sessions across every workspace (with a new Workspace column; conflicts with `--workspace`), and `--limit 0` means unlimited, including the scan probe ([`6316ba6`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/6316ba6)). Reimplements ideas from PR [#23](https://github.com/Dicklesworthstone/cross_agent_session_resumer/pull/23).
+
+### Fixed
+
+- **Workspace matching tolerates path spellings**: symlinks, `/private` prefixes, and trailing slashes no longer prevent a session from matching its workspace — reconciliation happens at all three match sites ([`6316ba6`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/6316ba6)).
+- **OpenCode writes agree with discovery**: the writer canonicalizes the target workspace path, so written sessions are found by cwd-based discovery on macOS (fixes 9 real test failures at main; from PR [#24](https://github.com/Dicklesworthstone/cross_agent_session_resumer/pull/24)'s report) ([`ef096c0`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ef096c0)).
+
+### Build
+
+- Permission-enforcement tests probe the premise first, so suites stop false-failing on root-privileged CI/fleet workers ([`8bf9241`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/8bf9241)).
+
+---
+
 ## [v0.3.1] -- 2026-08-15
 
 Patch release. Tag + GitHub Release (linux x86_64 musl binary).
