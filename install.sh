@@ -627,6 +627,7 @@ resolve_version() {
 OS=""
 ARCH=""
 TARGET=""
+NO_PREBUILT_REASON=""
 
 detect_platform() {
   OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -643,17 +644,19 @@ detect_platform() {
   fi
 
   TARGET=""
+  NO_PREBUILT_REASON=""
   case "${OS}-${ARCH}" in
     linux-x86_64)   TARGET="x86_64-unknown-linux-musl" ;;
     linux-aarch64)  TARGET="aarch64-unknown-linux-musl" ;;
     darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-    *) :;;
+    *) NO_PREBUILT_REASON="no prebuilt binaries are published for ${OS}/${ARCH}" ;;
   esac
 
   if [ -z "$TARGET" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ] && [ -z "$OFFLINE_TARBALL" ]; then
-    warn "No prebuilt binary for ${OS}/${ARCH}; falling back to build-from-source"
-    FROM_SOURCE=1
+    err "Cannot install prebuilt binary: ${NO_PREBUILT_REASON:-platform ${OS}/${ARCH} is not supported}"
+    err "To build from source instead (requires git + Rust nightly), re-run with: --from-source"
+    exit 1
   fi
 }
 
@@ -668,8 +671,9 @@ set_artifact_url() {
       TAR="casr-${TARGET}.tar.xz"
       URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
     else
-      warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-      FROM_SOURCE=1
+      err "Cannot install prebuilt binary: ${NO_PREBUILT_REASON:-no prebuilt artifact for ${OS}/${ARCH}}"
+      err "To build from source instead (requires git + Rust nightly), re-run with: --from-source"
+      exit 1
     fi
   fi
 }
@@ -1283,8 +1287,14 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$URL" ]; then
   fi
 
   if [ "$DOWNLOAD_OK" -eq 0 ]; then
-    warn "No prebuilt binary found; falling back to build-from-source"
-    FROM_SOURCE=1
+    # A mapped target triple whose release asset 404s is a release-packaging
+    # bug, not a reason to silently compile the world on the user's machine.
+    err "Download failed: no prebuilt binary could be fetched for supported target ${TARGET:-${OS}/${ARCH}}"
+    err "Tried: $URL"
+    err "This usually means the release is missing an asset. Please report it:"
+    err "  https://github.com/${OWNER}/${REPO}/issues"
+    err "To build from source instead (requires git + Rust nightly), re-run with: --from-source"
+    exit 1
   fi
 fi
 
