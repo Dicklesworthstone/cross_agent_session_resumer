@@ -1,10 +1,15 @@
 //! OpenCode provider — reads/writes sessions from SQLite `opencode.db`.
 //!
 //! OpenCode stores session state in a SQLite database named `opencode.db`.
-//! The canonical schema includes:
+//! The schema this provider reads/writes is the legacy (plural) one:
 //! - `sessions` table
 //! - `messages` table
 //! - `files` table
+//!
+//! OpenCode 1.x ships a different, singular event-sourced schema
+//! (`session`/`message`/`part`). That schema is not readable yet; when it is
+//! encountered, this provider fails loudly naming the mismatch instead of
+//! reporting zero sessions (issue #26).
 //!
 //! casr addresses specific OpenCode sessions using a virtual path form:
 //! `<db-path>/<urlencoded-session-id>`
@@ -98,6 +103,24 @@ impl OpenCode {
         dirs
     }
 
+    /// Candidate DB paths derived from the XDG data directory.
+    ///
+    /// OpenCode 1.x stores its database under the XDG data home
+    /// (`$XDG_DATA_HOME/opencode/opencode.db`, defaulting to
+    /// `~/.local/share/opencode/opencode.db`). Users who redirect
+    /// `XDG_DATA_HOME` per project otherwise get no discovery hit at all
+    /// (issue #26).
+    fn xdg_data_db_candidates(xdg_data_home: Option<&str>, home: Option<&Path>) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(xdg) = xdg_data_home.map(str::trim).filter(|s| !s.is_empty()) {
+            candidates.push(PathBuf::from(xdg).join("opencode").join(DB_FILENAME));
+        }
+        if let Some(home) = home {
+            candidates.push(home.join(".local/share/opencode").join(DB_FILENAME));
+        }
+        candidates
+    }
+
     /// Candidate DB paths from current directory and parents (`.opencode/opencode.db`).
     fn cwd_ancestor_db_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
@@ -129,6 +152,10 @@ impl OpenCode {
         if let Some(home) = dirs::home_dir() {
             candidates.push(home.join(DATA_DIRNAME).join(DB_FILENAME));
         }
+        candidates.extend(Self::xdg_data_db_candidates(
+            std::env::var("XDG_DATA_HOME").ok().as_deref(),
+            dirs::home_dir().as_deref(),
+        ));
         for data_dir in Self::configured_data_dirs() {
             candidates.push(data_dir.join(DB_FILENAME));
         }
@@ -216,6 +243,72 @@ impl OpenCode {
         conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")
             .and_then(|mut stmt| stmt.exists(rusqlite::params![table]))
             .unwrap_or(false)
+    }
+
+    /// List every table name in the DB, sorted (from `sqlite_master`).
+    fn list_tables(conn: &Connection) -> Vec<String> {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
+    /// Tables the legacy (plural) read path requires.
+    const READ_TABLES: [&'static str; 2] = ["sessions", "messages"];
+
+    /// If the DB does not carry the legacy plural schema this reader targets,
+    /// build a loud diagnostic naming the missing table(s) and the schema
+    /// actually present. Returns `None` when the schema is readable.
+    ///
+    /// The silent-zero behavior this replaces was indistinguishable from
+    /// "no sessions yet" (issue #26).
+    fn schema_mismatch(conn: &Connection, db_path: &Path) -> Option<String> {
+        let missing: Vec<&str> = Self::READ_TABLES
+            .iter()
+            .copied()
+            .filter(|table| !Self::table_exists(conn, table))
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+
+        let found = Self::list_tables(conn);
+        let found_desc = if found.is_empty() {
+            "no tables at all".to_string()
+        } else {
+            format!("tables present: {}", found.join(", "))
+        };
+
+        let mut msg = format!(
+            "OpenCode DB {} does not match the legacy schema casr reads: missing table(s): {}; {}",
+            db_path.display(),
+            missing.join(", "),
+            found_desc,
+        );
+
+        let looks_like_1x = found.iter().any(|t| t == "session");
+        if looks_like_1x {
+            msg.push_str(
+                ". This looks like the OpenCode 1.x singular, event-sourced schema \
+                 (session/message/part), which casr cannot read yet — see \
+                 https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/26",
+            );
+        }
+
+        Some(msg)
+    }
+
+    /// Bail with the schema diagnostic when the DB is not readable.
+    fn check_read_schema(conn: &Connection, db_path: &Path) -> anyhow::Result<()> {
+        match Self::schema_mismatch(conn, db_path) {
+            Some(msg) => Err(anyhow::anyhow!(msg)),
+            None => Ok(()),
+        }
     }
 
     fn trigger_exists(conn: &Connection, trigger: &str) -> bool {
@@ -310,12 +403,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         db_path: &Path,
         session_id: &str,
     ) -> anyhow::Result<CanonicalSession> {
-        if !Self::table_exists(conn, "sessions") {
-            anyhow::bail!("OpenCode DB has no sessions table: {}", db_path.display());
-        }
-        if !Self::table_exists(conn, "messages") {
-            anyhow::bail!("OpenCode DB has no messages table: {}", db_path.display());
-        }
+        Self::check_read_schema(conn, db_path)?;
 
         let (title_raw, created_raw, updated_raw, parent_session_id, prompt_tokens, completion_tokens, cost): (
             String,
@@ -509,6 +597,11 @@ impl Provider for OpenCode {
                 continue;
             };
 
+            if let Some(mismatch) = Self::schema_mismatch(&conn, &db_path) {
+                tracing::warn!("skipping unreadable OpenCode DB: {mismatch}");
+                continue;
+            }
+
             if Self::session_exists(&conn, session_id) {
                 let virtual_path = Self::virtual_session_path(&db_path, session_id);
                 debug!(
@@ -534,6 +627,8 @@ impl Provider for OpenCode {
 
         // Direct DB path (`.../opencode.db`) — choose newest root session.
         let conn = Self::open_db(path)?;
+        // Fail loudly on a schema mismatch instead of reporting an empty DB.
+        Self::check_read_schema(&conn, path)?;
         let Some(session_id) = Self::newest_root_session_id(&conn) else {
             anyhow::bail!("no OpenCode sessions found in {}", path.display());
         };
@@ -703,7 +798,11 @@ impl Provider for OpenCode {
             let Ok(conn) = Self::open_db(db_path) else {
                 continue;
             };
-            if !Self::table_exists(&conn, "sessions") {
+            if let Some(mismatch) = Self::schema_mismatch(&conn, db_path) {
+                // Surface the mismatch instead of silently listing 0 sessions
+                // (the default log filter shows warnings, so this is visible
+                // in plain `casr list` output).
+                tracing::warn!("skipping unreadable OpenCode DB: {mismatch}");
                 continue;
             }
 
@@ -1651,6 +1750,121 @@ mod tests {
             ids.contains(&second_written.session_id.as_str()),
             "second session should be listed"
         );
+    }
+
+    // ── schema mismatch diagnostics (issue #26) ─────────────────────────
+
+    /// Build a fixture DB carrying the OpenCode 1.x singular, event-sourced
+    /// schema (`session`/`message`/`part` — no plural tables).
+    fn create_singular_schema_db(db_path: &Path) {
+        let conn = Connection::open(db_path).expect("create fixture db");
+        conn.execute_batch(
+            r#"
+CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, time_created INTEGER);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, time_created INTEGER);
+CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, type TEXT, data TEXT);
+CREATE TABLE event (id INTEGER PRIMARY KEY, type TEXT, payload TEXT);
+INSERT INTO session (id, title, time_created)
+VALUES ('ses_9f2c4d81bbfe3aQwErTyUiOp', 'live session', 1700000000000);
+"#,
+        )
+        .expect("populate fixture schema");
+    }
+
+    /// Regression for #26: an OpenCode 1.x DB (singular `session`/`message`
+    /// tables) must produce a loud diagnostic naming the missing legacy
+    /// tables and the schema actually found — not a silent "0 sessions".
+    #[test]
+    fn read_session_on_singular_schema_fails_loudly_naming_schema() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_singular_schema_db(&db_path);
+
+        let err = OpenCode
+            .read_session(&db_path)
+            .expect_err("singular schema must not read as an empty DB");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("missing table(s): sessions, messages"),
+            "error must name the missing legacy tables, got: {msg}"
+        );
+        assert!(
+            msg.contains("session") && msg.contains("message") && msg.contains("part"),
+            "error must list the tables actually present, got: {msg}"
+        );
+        assert!(
+            msg.contains("1.x"),
+            "error must identify the detected 1.x schema, got: {msg}"
+        );
+        assert!(
+            !msg.contains("no OpenCode sessions found"),
+            "must not be misreported as an empty DB, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_session_by_virtual_path_on_singular_schema_fails_loudly() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_singular_schema_db(&db_path);
+
+        let virtual_path =
+            OpenCode::virtual_session_path(&db_path, "ses_9f2c4d81bbfe3aQwErTyUiOp");
+        let err = OpenCode
+            .read_session(&virtual_path)
+            .expect_err("singular schema must fail loudly");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing table(s): sessions, messages"),
+            "error must name the missing legacy tables, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_mismatch_none_for_legacy_schema() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        let conn = OpenCode::open_db_rw(&db_path).expect("create db");
+        OpenCode::ensure_schema(&conn).expect("schema");
+        assert_eq!(OpenCode::schema_mismatch(&conn, &db_path), None);
+    }
+
+    #[test]
+    fn schema_mismatch_on_empty_db_reports_no_tables() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("create empty db");
+        let msg = OpenCode::schema_mismatch(&conn, &db_path).expect("empty db must mismatch");
+        assert!(msg.contains("no tables at all"), "got: {msg}");
+        assert!(!msg.contains("1.x"), "empty db is not a 1.x schema: {msg}");
+    }
+
+    // ── XDG_DATA_HOME discovery (issue #26) ─────────────────────────────
+
+    #[test]
+    fn xdg_data_db_candidates_prefers_env_then_default() {
+        let home = PathBuf::from("/home/user");
+        let candidates =
+            OpenCode::xdg_data_db_candidates(Some("/custom/data"), Some(home.as_path()));
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/custom/data/opencode/opencode.db"),
+                PathBuf::from("/home/user/.local/share/opencode/opencode.db"),
+            ]
+        );
+    }
+
+    #[test]
+    fn xdg_data_db_candidates_ignores_blank_env() {
+        let home = PathBuf::from("/home/user");
+        let candidates = OpenCode::xdg_data_db_candidates(Some("  "), Some(home.as_path()));
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/home/user/.local/share/opencode/opencode.db")]
+        );
+        assert!(OpenCode::xdg_data_db_candidates(None, None).is_empty());
     }
 
     #[test]
