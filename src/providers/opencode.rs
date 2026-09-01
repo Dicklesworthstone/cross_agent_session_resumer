@@ -1,15 +1,17 @@
 //! OpenCode provider — reads/writes sessions from SQLite `opencode.db`.
 //!
 //! OpenCode stores session state in a SQLite database named `opencode.db`.
-//! The schema this provider reads/writes is the legacy (plural) one:
-//! - `sessions` table
-//! - `messages` table
-//! - `files` table
+//! Two on-disk schemas exist, and the reader detects which one a DB carries
+//! by introspecting `sqlite_master` (issue #26):
 //!
-//! OpenCode 1.x ships a different, singular event-sourced schema
-//! (`session`/`message`/`part`). That schema is not readable yet; when it is
-//! encountered, this provider fails loudly naming the mismatch instead of
-//! reporting zero sessions (issue #26).
+//! - **Legacy (plural)** — the Go-era layout: `sessions`, `messages` (with a
+//!   `parts` JSON column) and `files`. Read and written.
+//! - **1.x (singular)** — the event-sourced layout: `session`, `message` and
+//!   `part`, where each message/part row carries a `data` JSON blob. Read
+//!   only; direct writes into a live 1.x DB are refused.
+//!
+//! A DB matching neither schema fails loudly naming the missing tables and
+//! the tables actually present, instead of reporting zero sessions.
 //!
 //! casr addresses specific OpenCode sessions using a virtual path form:
 //! `<db-path>/<urlencoded-session-id>`
@@ -31,6 +33,41 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 
 /// OpenCode provider implementation.
 pub struct OpenCode;
+
+/// Which on-disk layout an `opencode.db` carries (see module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbSchema {
+    /// Go-era plural tables: `sessions` / `messages` (`parts` JSON column).
+    Legacy,
+    /// OpenCode 1.x singular tables: `session` / `message` / `part`, each
+    /// message and part row carrying a `data` JSON blob.
+    V1,
+}
+
+impl DbSchema {
+    /// Tables a DB must carry to be read as this schema.
+    const fn required_tables(self) -> &'static [&'static str] {
+        match self {
+            Self::Legacy => &["sessions", "messages"],
+            Self::V1 => &["session", "message", "part"],
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V1 => "1.x",
+        }
+    }
+
+    /// Metadata tag stored in `session.metadata.opencode_schema`.
+    const fn metadata_tag(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V1 => "v1",
+        }
+    }
+}
 
 const DB_FILENAME: &str = "opencode.db";
 const DATA_DIRNAME: &str = ".opencode";
@@ -258,23 +295,33 @@ impl OpenCode {
         rows.flatten().collect()
     }
 
-    /// Tables the legacy (plural) read path requires.
-    const READ_TABLES: [&'static str; 2] = ["sessions", "messages"];
-
-    /// If the DB does not carry the legacy plural schema this reader targets,
-    /// build a loud diagnostic naming the missing table(s) and the schema
-    /// actually present. Returns `None` when the schema is readable.
+    /// Detect which OpenCode schema a DB carries by introspecting
+    /// `sqlite_master`, or build a loud diagnostic naming the missing
+    /// table(s) and the tables actually present.
     ///
     /// The silent-zero behavior this replaces was indistinguishable from
     /// "no sessions yet" (issue #26).
-    fn schema_mismatch(conn: &Connection, db_path: &Path) -> Option<String> {
-        let missing: Vec<&str> = Self::READ_TABLES
+    fn detect_schema(conn: &Connection, db_path: &Path) -> anyhow::Result<DbSchema> {
+        let has = |table: &str| Self::table_exists(conn, table);
+
+        let missing_legacy: Vec<&str> = DbSchema::Legacy
+            .required_tables()
             .iter()
             .copied()
-            .filter(|table| !Self::table_exists(conn, table))
+            .filter(|table| !has(table))
             .collect();
-        if missing.is_empty() {
-            return None;
+        if missing_legacy.is_empty() {
+            return Ok(DbSchema::Legacy);
+        }
+
+        let missing_v1: Vec<&str> = DbSchema::V1
+            .required_tables()
+            .iter()
+            .copied()
+            .filter(|table| !has(table))
+            .collect();
+        if missing_v1.is_empty() {
+            return Ok(DbSchema::V1);
         }
 
         let found = Self::list_tables(conn);
@@ -284,31 +331,37 @@ impl OpenCode {
             format!("tables present: {}", found.join(", "))
         };
 
-        let mut msg = format!(
-            "OpenCode DB {} does not match the legacy schema casr reads: missing table(s): {}; {}",
+        // Report against whichever schema the DB is closer to, so a partial
+        // 1.x DB names its own missing tables rather than the legacy ones.
+        let (schema, missing) = if missing_v1.len() < DbSchema::V1.required_tables().len() {
+            (DbSchema::V1, missing_v1)
+        } else {
+            (DbSchema::Legacy, missing_legacy)
+        };
+
+        anyhow::bail!(
+            "OpenCode DB {} does not match either schema casr reads \
+             (legacy plural sessions/messages, or 1.x singular session/message/part); \
+             closest is the {} schema, missing table(s): {}; {}",
             db_path.display(),
+            schema.label(),
             missing.join(", "),
             found_desc,
-        );
-
-        let looks_like_1x = found.iter().any(|t| t == "session");
-        if looks_like_1x {
-            msg.push_str(
-                ". This looks like the OpenCode 1.x singular, event-sourced schema \
-                 (session/message/part), which casr cannot read yet — see \
-                 https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/26",
-            );
-        }
-
-        Some(msg)
+        )
     }
 
-    /// Bail with the schema diagnostic when the DB is not readable.
-    fn check_read_schema(conn: &Connection, db_path: &Path) -> anyhow::Result<()> {
-        match Self::schema_mismatch(conn, db_path) {
-            Some(msg) => Err(anyhow::anyhow!(msg)),
-            None => Ok(()),
-        }
+    /// The schema diagnostic as a plain message, or `None` when readable.
+    fn schema_mismatch(conn: &Connection, db_path: &Path) -> Option<String> {
+        Self::detect_schema(conn, db_path)
+            .err()
+            .map(|err| err.to_string())
+    }
+
+    /// Pull a column by name, tolerating columns absent in older or newer
+    /// OpenCode 1.x revisions (returns `None` instead of failing the row).
+    fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, name: &str) -> Option<T> {
+        let idx = row.as_ref().column_index(name).ok()?;
+        row.get::<_, Option<T>>(idx).ok().flatten()
     }
 
     fn trigger_exists(conn: &Connection, trigger: &str) -> bool {
@@ -368,26 +421,43 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         Ok(())
     }
 
-    fn session_exists(conn: &Connection, session_id: &str) -> bool {
-        if !Self::table_exists(conn, "sessions") {
-            return false;
-        }
-        conn.prepare("SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1")
+    fn session_exists(conn: &Connection, schema: DbSchema, session_id: &str) -> bool {
+        let sql = match schema {
+            DbSchema::Legacy => "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
+            DbSchema::V1 => "SELECT 1 FROM session WHERE id = ?1 LIMIT 1",
+        };
+        conn.prepare(sql)
             .and_then(|mut stmt| stmt.exists(rusqlite::params![session_id]))
             .unwrap_or(false)
     }
 
-    fn newest_root_session_id(conn: &Connection) -> Option<String> {
-        if !Self::table_exists(conn, "sessions") {
-            return None;
-        }
+    fn newest_root_session_id(conn: &Connection, schema: DbSchema) -> Option<String> {
+        let sql = match schema {
+            DbSchema::Legacy => {
+                "SELECT id FROM sessions WHERE parent_session_id IS NULL \
+                 ORDER BY created_at DESC LIMIT 1"
+            }
+            DbSchema::V1 => {
+                "SELECT id FROM session WHERE parent_id IS NULL \
+                 ORDER BY time_created DESC, id DESC LIMIT 1"
+            }
+        };
+        conn.query_row(sql, [], |row| row.get(0)).ok()
+    }
 
-        conn.query_row(
-            "SELECT id FROM sessions WHERE parent_session_id IS NULL ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok()
+    /// All session ids in the DB, newest first.
+    fn all_session_ids(conn: &Connection, schema: DbSchema) -> Vec<String> {
+        let sql = match schema {
+            DbSchema::Legacy => "SELECT id FROM sessions ORDER BY created_at DESC",
+            DbSchema::V1 => "SELECT id FROM session ORDER BY time_created DESC, id DESC",
+        };
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
     }
 
     fn workspace_from_db_path(db_path: &Path) -> Option<PathBuf> {
