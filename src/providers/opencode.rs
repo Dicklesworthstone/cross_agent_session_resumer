@@ -473,8 +473,237 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         db_path: &Path,
         session_id: &str,
     ) -> anyhow::Result<CanonicalSession> {
-        Self::check_read_schema(conn, db_path)?;
+        match Self::detect_schema(conn, db_path)? {
+            DbSchema::Legacy => Self::read_legacy_session(conn, db_path, session_id),
+            DbSchema::V1 => Self::read_v1_session(conn, db_path, session_id),
+        }
+    }
 
+    /// Read a session from the OpenCode 1.x singular schema.
+    ///
+    /// `session` columns are pulled by name with tolerance for revisions that
+    /// lack some of them; `message.data` / `part.data` are the JSON blobs
+    /// OpenCode hydrates its `Message`/`Part` values from (ids and
+    /// `session_id`/`message_id` live in dedicated columns, not in `data`).
+    fn read_v1_session(
+        conn: &Connection,
+        db_path: &Path,
+        session_id: &str,
+    ) -> anyhow::Result<CanonicalSession> {
+        let session_row = conn
+            .query_row(
+                "SELECT * FROM session WHERE id = ?1 LIMIT 1",
+                rusqlite::params![session_id],
+                |row| {
+                    Ok(V1SessionRow {
+                        title: Self::col(row, "title"),
+                        directory: Self::col(row, "directory"),
+                        parent_id: Self::col(row, "parent_id"),
+                        time_created: Self::col(row, "time_created"),
+                        time_updated: Self::col(row, "time_updated"),
+                        cost: Self::col(row, "cost"),
+                        tokens_input: Self::col(row, "tokens_input"),
+                        tokens_output: Self::col(row, "tokens_output"),
+                        tokens_reasoning: Self::col(row, "tokens_reasoning"),
+                        slug: Self::col(row, "slug"),
+                        version: Self::col(row, "version"),
+                        project_id: Self::col(row, "project_id"),
+                        model_json: Self::col(row, "model"),
+                    })
+                },
+            )
+            .with_context(|| format!("session '{session_id}' not found in {}", db_path.display()))?;
+
+        // Parts grouped by message id. Join through `message` rather than
+        // relying on `part.session_id`, which older 1.x revisions lack.
+        let mut parts_by_message: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.message_id, p.id, p.data FROM part p
+                     JOIN message m ON m.id = p.message_id
+                     WHERE m.session_id = ?1
+                     ORDER BY p.message_id ASC, p.id ASC",
+                )
+                .context("failed to prepare OpenCode 1.x part query")?;
+            let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (message_id, part_id, data_json) = row?;
+                let mut part = data_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = part.as_object_mut() {
+                    obj.insert("id".to_string(), serde_json::Value::from(part_id));
+                }
+                parts_by_message.entry(message_id).or_default().push(part);
+            }
+        }
+
+        let mut started_at = session_row
+            .time_created
+            .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)));
+        let mut ended_at = session_row
+            .time_updated
+            .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)))
+            .or(started_at);
+        let mut model_counts: HashMap<String, usize> = HashMap::new();
+        let mut messages = Vec::new();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM message WHERE session_id = ?1
+                 ORDER BY time_created ASC, id ASC",
+            )
+            .context("failed to prepare OpenCode 1.x message query")?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>("id")?,
+                Self::col::<i64>(row, "time_created"),
+                Self::col::<String>(row, "data"),
+            ))
+        })?;
+
+        for row in rows {
+            let (message_id, row_time_created, data_json) = row?;
+            let info = data_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let role_raw = info
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let created_raw = info
+                .pointer("/time/created")
+                .and_then(serde_json::Value::as_i64)
+                .or(row_time_created);
+            let timestamp = created_raw.and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)));
+            if let Some(ts) = timestamp {
+                started_at = Some(started_at.map_or(ts, |current| current.min(ts)));
+                ended_at = Some(ended_at.map_or(ts, |current| current.max(ts)));
+            }
+            if let Some(completed) = info
+                .pointer("/time/completed")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)))
+            {
+                ended_at = Some(ended_at.map_or(completed, |current| current.max(completed)));
+            }
+
+            // Assistant rows carry a flat `modelID`; user rows nest it under
+            // `model.modelID`. Only assistant turns count toward the session
+            // model, matching what actually produced the output.
+            let model_id = info
+                .get("modelID")
+                .or_else(|| info.pointer("/model/modelID"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(ToString::to_string);
+            if role_raw == "assistant"
+                && let Some(model_name) = &model_id
+            {
+                *model_counts.entry(model_name.clone()).or_insert(0) += 1;
+            }
+
+            let raw_parts = serde_json::Value::Array(
+                parts_by_message.remove(&message_id).unwrap_or_default(),
+            );
+            let (content, tool_calls, tool_results) = parse_v1_parts(&raw_parts);
+
+            messages.push(CanonicalMessage {
+                idx: 0,
+                role: normalize_role(role_raw),
+                content,
+                timestamp,
+                author: model_id,
+                tool_calls,
+                tool_results,
+                extra: serde_json::json!({
+                    "opencode_message_id": message_id,
+                    "opencode_message": info,
+                    "opencode_parts": raw_parts,
+                }),
+            });
+        }
+
+        reindex_messages(&mut messages);
+
+        let title = session_row
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| truncate_title(&m.content, 80))
+                    .filter(|t| !t.is_empty())
+            });
+
+        let model_name = model_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(name, _)| name)
+            .or_else(|| {
+                session_row
+                    .model_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|model| {
+                        model
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                    })
+            });
+
+        let workspace = session_row
+            .directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Self::workspace_from_db_path(db_path));
+
+        Ok(CanonicalSession {
+            session_id: session_id.to_string(),
+            provider_slug: "opencode".to_string(),
+            workspace,
+            title,
+            started_at,
+            ended_at,
+            messages,
+            metadata: serde_json::json!({
+                "opencode_db": db_path.display().to_string(),
+                "opencode_schema": DbSchema::V1.metadata_tag(),
+                "parent_session_id": session_row.parent_id,
+                "prompt_tokens": session_row.tokens_input.unwrap_or(0),
+                "completion_tokens": session_row.tokens_output.unwrap_or(0),
+                "reasoning_tokens": session_row.tokens_reasoning.unwrap_or(0),
+                "cost": session_row.cost.unwrap_or(0.0),
+                "directory": session_row.directory,
+                "slug": session_row.slug,
+                "opencode_version": session_row.version,
+                "project_id": session_row.project_id,
+            }),
+            source_path: Self::virtual_session_path(db_path, session_id),
+            model_name,
+        })
+    }
+
+    /// Read a session from the legacy (plural) schema.
+    fn read_legacy_session(
+        conn: &Connection,
+        db_path: &Path,
+        session_id: &str,
+    ) -> anyhow::Result<CanonicalSession> {
         let (title_raw, created_raw, updated_raw, parent_session_id, prompt_tokens, completion_tokens, cost): (
             String,
             i64,
@@ -606,6 +835,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
             messages,
             metadata: serde_json::json!({
                 "opencode_db": db_path.display().to_string(),
+                "opencode_schema": DbSchema::Legacy.metadata_tag(),
                 "parent_session_id": parent_session_id,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -667,12 +897,15 @@ impl Provider for OpenCode {
                 continue;
             };
 
-            if let Some(mismatch) = Self::schema_mismatch(&conn, &db_path) {
-                tracing::warn!("skipping unreadable OpenCode DB: {mismatch}");
-                continue;
-            }
+            let schema = match Self::detect_schema(&conn, &db_path) {
+                Ok(schema) => schema,
+                Err(mismatch) => {
+                    tracing::warn!("skipping unreadable OpenCode DB: {mismatch}");
+                    continue;
+                }
+            };
 
-            if Self::session_exists(&conn, session_id) {
+            if Self::session_exists(&conn, schema, session_id) {
                 let virtual_path = Self::virtual_session_path(&db_path, session_id);
                 debug!(
                     db = %db_path.display(),
@@ -698,8 +931,8 @@ impl Provider for OpenCode {
         // Direct DB path (`.../opencode.db`) — choose newest root session.
         let conn = Self::open_db(path)?;
         // Fail loudly on a schema mismatch instead of reporting an empty DB.
-        Self::check_read_schema(&conn, path)?;
-        let Some(session_id) = Self::newest_root_session_id(&conn) else {
+        let schema = Self::detect_schema(&conn, path)?;
+        let Some(session_id) = Self::newest_root_session_id(&conn, schema) else {
             anyhow::bail!("no OpenCode sessions found in {}", path.display());
         };
         Self::read_session_by_id(&conn, path, &session_id)
@@ -712,6 +945,19 @@ impl Provider for OpenCode {
     ) -> anyhow::Result<WrittenSession> {
         let db_path = Self::choose_target_db_path(session)?;
         let mut conn = Self::open_db_rw(&db_path)?;
+
+        // Never graft the legacy plural tables into a live OpenCode 1.x DB:
+        // its `session`/`message`/`part` rows are projections of an event
+        // log, so rows inserted behind its back would not be picked up and
+        // would leave the DB with two disagreeing schemas.
+        if Self::detect_schema(&conn, &db_path) == Ok(DbSchema::V1) {
+            anyhow::bail!(
+                "OpenCode DB {} uses the 1.x event-sourced schema (session/message/part); \
+                 casr can read it but does not write into it. Point OPENCODE_DB_PATH at a \
+                 separate database, or use a different target provider.",
+                db_path.display()
+            );
+        }
         Self::ensure_schema(&conn)?;
 
         let has_count_trigger =
@@ -732,7 +978,7 @@ impl Provider for OpenCode {
         // Honor `--force`: if the target session already exists, either overwrite
         // it (delete-then-insert; `ON DELETE CASCADE` clears messages/files) or
         // return a clean conflict error, matching the cursor provider's behavior.
-        if Self::session_exists(&conn, &target_session_id) {
+        if Self::session_exists(&conn, DbSchema::Legacy, &target_session_id) {
             if opts.force {
                 // `ensure_schema` already enabled `PRAGMA foreign_keys = ON` on
                 // this connection, so deleting the session cascades to messages
@@ -868,26 +1114,20 @@ impl Provider for OpenCode {
             let Ok(conn) = Self::open_db(db_path) else {
                 continue;
             };
-            if let Some(mismatch) = Self::schema_mismatch(&conn, db_path) {
-                // Surface the mismatch instead of silently listing 0 sessions
-                // (the default log filter shows warnings, so this is visible
-                // in plain `casr list` output).
-                tracing::warn!("skipping unreadable OpenCode DB: {mismatch}");
-                continue;
-            }
-
-            let Ok(mut stmt) = conn.prepare("SELECT id FROM sessions ORDER BY created_at DESC")
-            else {
-                continue;
+            let schema = match Self::detect_schema(&conn, db_path) {
+                Ok(schema) => schema,
+                Err(mismatch) => {
+                    // Surface the mismatch instead of silently listing 0
+                    // sessions (the default log filter shows warnings, so
+                    // this is visible in plain `casr list` output).
+                    tracing::warn!("skipping unreadable OpenCode DB: {mismatch}");
+                    continue;
+                }
             };
 
-            let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-                continue;
-            };
-
-            for row in rows.flatten() {
-                let virtual_path = Self::virtual_session_path(db_path, &row);
-                results.push((row, virtual_path));
+            for session_id in Self::all_session_ids(&conn, schema) {
+                let virtual_path = Self::virtual_session_path(db_path, &session_id);
+                results.push((session_id, virtual_path));
             }
         }
 
