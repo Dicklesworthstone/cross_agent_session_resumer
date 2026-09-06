@@ -24,7 +24,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
 2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. "I think it's safe" is never acceptable.
-3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
+3. **Inspect freely, mutate carefully:** Read-only commands (`git status`, `git diff`, `git log`, `git show`, reading files) never need permission — run them whenever they help you understand the state of the tree. When cleanup or rollbacks are needed, prefer reversible options (copying to backups, committing) and ask before anything that rewrites the working tree or index. `git stash` is a mutation, not a read: in a shared checkout it sweeps up other agents' in-progress work (see the concurrency note near the end of this file), so it needs the same approval as any other mutation. Only after that should a destructive command even be considered.
 4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
 5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
 
@@ -44,6 +44,8 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 **If you see `master` referenced anywhere:**
 1. Update it to `main`
 2. Ensure `master` is synchronized: `git push origin main:master`
+
+Mirroring is part of pushing, not a separate publication step: it only ever fast-forwards `master` to the commit that is already on `main`. If you have not pushed anything to `main`, there is nothing to mirror.
 
 ---
 
@@ -752,7 +754,7 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 ### Common Pitfalls
 
 - `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
-- `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
+- `"FILE_RESERVATION_CONFLICT"`: Message the holder to coordinate, adjust patterns to disjoint paths, wait for expiry, or — only when the work is genuinely compatible with the holder's — use a non-exclusive reservation
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
 ---
@@ -1083,7 +1085,7 @@ br sync --flush-only  # Export to JSONL (NO git operations)
 
 ### Session Protocol
 
-**Before ending any session, run this checklist:**
+**Before ending any session in which you changed something (code, docs, or beads), run this checklist:**
 
 ```bash
 git status              # Check what changed
@@ -1093,6 +1095,8 @@ git add .beads/         # Stage beads changes
 git commit -m "..."     # Commit everything together
 git push                # Push to remote
 ```
+
+A read-only session (review, investigation, answering a question) produces nothing to commit or push — skip the git steps and just hand off.
 
 ### Best Practices
 
@@ -1106,7 +1110,7 @@ git push                # Push to remote
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below.
+**When ending a work session that produced changes**, you MUST complete ALL steps below. A read-only session (review, investigation, answering a question) has nothing to commit or push — file issues for anything you found, then hand off.
 
 **MANDATORY WORKFLOW:**
 
@@ -1165,6 +1169,8 @@ Next steps (pick one)
 ```
 
 NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
+
+To be explicit about how this fits with the rest of this file, because it is deliberate and not an oversight: in this repo many agents share one checkout, so a commit that carries another agent's in-progress hunks alongside your own is normal and expected — `git add -A` before a commit is fine here. "Preserve other agents' work" and "treat it as your own" are the same instruction, not competing ones: both mean the work stays in the tree and goes forward with the next commit. The only things that are ever wrong are stashing, reverting, checking out over, or otherwise removing edits you did not write. And if your session produced no changes of its own, you have nothing to commit — leave the tree exactly as you found it.
 
 ---
 
