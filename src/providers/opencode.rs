@@ -1,17 +1,24 @@
 //! OpenCode provider — reads/writes sessions from SQLite `opencode.db`.
 //!
 //! OpenCode stores session state in a SQLite database named `opencode.db`.
-//! Two on-disk schemas exist, and the reader detects which one a DB carries
-//! by introspecting `sqlite_master` (issue #26):
+//! Three on-disk schemas exist, and the reader detects which one a DB carries
+//! by introspecting `sqlite_master` (issues #26, #30):
 //!
 //! - **Legacy (plural)** — the Go-era layout: `sessions`, `messages` (with a
 //!   `parts` JSON column) and `files`. Read and written.
 //! - **1.x (singular)** — the event-sourced layout: `session`, `message` and
 //!   `part`, where each message/part row carries a `data` JSON blob. Read
 //!   only; direct writes into a live 1.x DB are refused.
+//! - **2.x** — the OpenCode 2 layout: `session_v2` plus a per-entry
+//!   `session_message` log (`type`, app-owned `seq`, `data` JSON blob).
+//!   Read only; direct writes into a live 2.x DB are refused.
 //!
-//! A DB matching neither schema fails loudly naming the missing tables and
-//! the tables actually present, instead of reporting zero sessions.
+//! A DB migrated from 1.x to 2.x still carries the stale 1.x tables, so the
+//! 2.x layout is probed first; otherwise such a DB would read as 1.x and
+//! surface only the dead pre-migration sessions.
+//!
+//! A DB matching no schema fails loudly naming the missing tables and the
+//! tables actually present, instead of reporting zero sessions.
 //!
 //! casr addresses specific OpenCode sessions using a virtual path form:
 //! `<db-path>/<urlencoded-session-id>`
@@ -42,14 +49,22 @@ enum DbSchema {
     /// OpenCode 1.x singular tables: `session` / `message` / `part`, each
     /// message and part row carrying a `data` JSON blob.
     V1,
+    /// OpenCode 2.x tables: `session_v2` plus the `session_message` entry
+    /// log (`type` + `seq` columns, `data` JSON blob).
+    V2,
 }
 
 impl DbSchema {
+    /// Detection order. 2.x goes first because a DB migrated from 1.x keeps
+    /// the stale 1.x tables alongside the live 2.x ones (issue #30).
+    const DETECTION_ORDER: [Self; 3] = [Self::V2, Self::Legacy, Self::V1];
+
     /// Tables a DB must carry to be read as this schema.
     const fn required_tables(self) -> &'static [&'static str] {
         match self {
             Self::Legacy => &["sessions", "messages"],
             Self::V1 => &["session", "message", "part"],
+            Self::V2 => &["session_v2", "session_message"],
         }
     }
 
@@ -57,6 +72,7 @@ impl DbSchema {
         match self {
             Self::Legacy => "legacy",
             Self::V1 => "1.x",
+            Self::V2 => "2.x",
         }
     }
 
@@ -65,6 +81,32 @@ impl DbSchema {
         match self {
             Self::Legacy => "legacy",
             Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    /// Whether casr may write into a DB carrying this schema. Only the
+    /// legacy layout is plain row storage; 1.x and 2.x rows are projections
+    /// of OpenCode's event log and must not be grafted behind its back.
+    const fn writable(self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+
+    /// Why direct writes into this schema are refused (see [`Self::writable`]).
+    const fn write_refusal_reason(self) -> &'static str {
+        match self {
+            Self::Legacy => "",
+            Self::V1 => {
+                "its session/message/part rows are projections of an event log, \
+                 so rows inserted behind its back would not be picked up and would \
+                 leave the DB with two disagreeing schemas"
+            }
+            Self::V2 => {
+                "its session_message rows are a projection of OpenCode's event log \
+                 (the seq column is assigned by OpenCode and session_v2 rows are \
+                 bound to the project table), so rows inserted behind its back would \
+                 be ignored or corrupt the projection"
+            }
         }
     }
 }
@@ -302,26 +344,40 @@ impl OpenCode {
     /// The silent-zero behavior this replaces was indistinguishable from
     /// "no sessions yet" (issue #26).
     fn detect_schema(conn: &Connection, db_path: &Path) -> anyhow::Result<DbSchema> {
-        let has = |table: &str| Self::table_exists(conn, table);
+        let missing_tables = |schema: DbSchema| -> Vec<&'static str> {
+            schema
+                .required_tables()
+                .iter()
+                .copied()
+                .filter(|table| !Self::table_exists(conn, table))
+                .collect()
+        };
 
-        let missing_legacy: Vec<&str> = DbSchema::Legacy
-            .required_tables()
-            .iter()
-            .copied()
-            .filter(|table| !has(table))
-            .collect();
-        if missing_legacy.is_empty() {
-            return Ok(DbSchema::Legacy);
+        let mut missing_by_schema = Vec::with_capacity(DbSchema::DETECTION_ORDER.len());
+        for schema in DbSchema::DETECTION_ORDER {
+            let missing = missing_tables(schema);
+            if missing.is_empty() {
+                return Ok(schema);
+            }
+            missing_by_schema.push((schema, missing));
         }
 
-        let missing_v1: Vec<&str> = DbSchema::V1
-            .required_tables()
+        // Closest schema for the diagnostic: the one with the most required
+        // tables present, so a partial 1.x DB names its own missing tables
+        // rather than the legacy ones. Ties fall to the legacy layout, so an
+        // empty DB is reported against it.
+        let present =
+            |schema: DbSchema, missing: &[&str]| schema.required_tables().len() - missing.len();
+        let (mut schema, mut missing) = missing_by_schema
             .iter()
-            .copied()
-            .filter(|table| !has(table))
-            .collect();
-        if missing_v1.is_empty() {
-            return Ok(DbSchema::V1);
+            .find(|(schema, _)| *schema == DbSchema::Legacy)
+            .cloned()
+            .unwrap_or((DbSchema::Legacy, Vec::new()));
+        for (candidate, candidate_missing) in missing_by_schema {
+            if present(candidate, &candidate_missing) > present(schema, &missing) {
+                schema = candidate;
+                missing = candidate_missing;
+            }
         }
 
         let found = Self::list_tables(conn);
@@ -331,23 +387,39 @@ impl OpenCode {
             format!("tables present: {}", found.join(", "))
         };
 
-        // Report against whichever schema the DB is closer to, so a partial
-        // 1.x DB names its own missing tables rather than the legacy ones.
-        let (schema, missing) = if missing_v1.len() < DbSchema::V1.required_tables().len() {
-            (DbSchema::V1, missing_v1)
-        } else {
-            (DbSchema::Legacy, missing_legacy)
-        };
-
         anyhow::bail!(
-            "OpenCode DB {} does not match either schema casr reads \
-             (legacy plural sessions/messages, or 1.x singular session/message/part); \
+            "OpenCode DB {} does not match any schema casr reads \
+             (2.x session_v2/session_message, legacy plural sessions/messages, \
+             or 1.x singular session/message/part); \
              closest is the {} schema, missing table(s): {}; {}",
             db_path.display(),
             schema.label(),
             missing.join(", "),
             found_desc,
         )
+    }
+
+    /// Refuse to write into a DB whose schema casr only reads (1.x / 2.x).
+    ///
+    /// Called on a read-only connection BEFORE any read-write open: opening a
+    /// live WAL-mode DB read-write, even just to inspect it, can checkpoint
+    /// its WAL into the main file on close, which is a write into a database
+    /// OpenCode owns.
+    fn refuse_read_only_schema(conn: &Connection, db_path: &Path) -> anyhow::Result<()> {
+        if let Ok(schema) = Self::detect_schema(conn, db_path)
+            && !schema.writable()
+        {
+            anyhow::bail!(
+                "OpenCode DB {} uses the {} schema ({}): {}. casr can read it but does \
+                 not write into it. Point OPENCODE_DB_PATH at a separate database, or \
+                 use a different target provider.",
+                db_path.display(),
+                schema.label(),
+                schema.required_tables().join("/"),
+                schema.write_refusal_reason(),
+            );
+        }
+        Ok(())
     }
 
     /// The schema diagnostic as a plain message, or `None` when readable.
@@ -426,6 +498,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         let sql = match schema {
             DbSchema::Legacy => "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
             DbSchema::V1 => "SELECT 1 FROM session WHERE id = ?1 LIMIT 1",
+            DbSchema::V2 => "SELECT 1 FROM session_v2 WHERE id = ?1 LIMIT 1",
         };
         conn.prepare(sql)
             .and_then(|mut stmt| stmt.exists(rusqlite::params![session_id]))
@@ -442,6 +515,10 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
                 "SELECT id FROM session WHERE parent_id IS NULL \
                  ORDER BY time_created DESC, id DESC LIMIT 1"
             }
+            DbSchema::V2 => {
+                "SELECT id FROM session_v2 WHERE parent_id IS NULL \
+                 ORDER BY time_created DESC, id DESC LIMIT 1"
+            }
         };
         conn.query_row(sql, [], |row| row.get(0)).ok()
     }
@@ -451,6 +528,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         let sql = match schema {
             DbSchema::Legacy => "SELECT id FROM sessions ORDER BY created_at DESC",
             DbSchema::V1 => "SELECT id FROM session ORDER BY time_created DESC, id DESC",
+            DbSchema::V2 => "SELECT id FROM session_v2 ORDER BY time_created DESC, id DESC",
         };
         let Ok(mut stmt) = conn.prepare(sql) else {
             return Vec::new();
@@ -477,7 +555,228 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         match Self::detect_schema(conn, db_path)? {
             DbSchema::Legacy => Self::read_legacy_session(conn, db_path, session_id),
             DbSchema::V1 => Self::read_v1_session(conn, db_path, session_id),
+            DbSchema::V2 => Self::read_v2_session(conn, db_path, session_id),
         }
+    }
+
+    /// Read a session from the OpenCode 2.x schema (`session_v2` +
+    /// `session_message`).
+    ///
+    /// 2.x keeps one `session_message` row per transcript entry, ordered by
+    /// the app-owned `seq` column, with the entry kind in a dedicated `type`
+    /// column and everything else (the `Session.Message.*` payload minus
+    /// `id`/`type`) in the `data` JSON blob. Ground truth: upstream
+    /// `packages/core/src/session/sql.ts` (tables) and
+    /// `packages/schema/src/session-message.ts` (payloads) on the `beta`
+    /// branch; the per-type mapping mirrors what OpenCode itself replays to
+    /// the model in `packages/core/src/session/runner/to-llm-message.ts`.
+    ///
+    /// | `type`                                                   | canonical                                          |
+    /// |----------------------------------------------------------|----------------------------------------------------|
+    /// | `user`                                                   | User: `text` plus `[file: …]` attachment markers    |
+    /// | `assistant`                                              | Assistant: `content[]` text / reasoning / tool parts |
+    /// | `system`                                                 | System: `text`                                     |
+    /// | `synthetic`, `skill`                                     | Tool: injected context, not typed by the user       |
+    /// | `shell`                                                  | Tool: the command and its captured output (background shells skipped) |
+    /// | `compaction` (`status: completed`)                       | System: the checkpoint summary + recent context    |
+    /// | `model-switched`, `agent-switched`, `location-switched`  | skipped (bookkeeping)                              |
+    fn read_v2_session(
+        conn: &Connection,
+        db_path: &Path,
+        session_id: &str,
+    ) -> anyhow::Result<CanonicalSession> {
+        let session_row = conn
+            .query_row(
+                "SELECT * FROM session_v2 WHERE id = ?1 LIMIT 1",
+                rusqlite::params![session_id],
+                |row| {
+                    Ok(V2SessionRow {
+                        title: Self::col(row, "title"),
+                        directory: Self::col(row, "directory"),
+                        parent_id: Self::col(row, "parent_id"),
+                        fork_session_id: Self::col(row, "fork_session_id"),
+                        project_id: Self::col(row, "project_id"),
+                        workspace_id: Self::col(row, "workspace_id"),
+                        slug: Self::col(row, "slug"),
+                        version: Self::col(row, "version"),
+                        agent: Self::col(row, "agent"),
+                        model_json: Self::col(row, "model"),
+                        cost: Self::col(row, "cost"),
+                        tokens_input: Self::col(row, "tokens_input"),
+                        tokens_output: Self::col(row, "tokens_output"),
+                        tokens_reasoning: Self::col(row, "tokens_reasoning"),
+                        tokens_cache_read: Self::col(row, "tokens_cache_read"),
+                        tokens_cache_write: Self::col(row, "tokens_cache_write"),
+                        time_created: Self::col(row, "time_created"),
+                        time_updated: Self::col(row, "time_updated"),
+                        time_archived: Self::col(row, "time_archived"),
+                    })
+                },
+            )
+            .with_context(|| {
+                format!("session '{session_id}' not found in {}", db_path.display())
+            })?;
+
+        let mut started_at = session_row
+            .time_created
+            .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)));
+        let mut ended_at = session_row
+            .time_updated
+            .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)))
+            .or(started_at);
+        let mut model_counts: HashMap<String, usize> = HashMap::new();
+        let mut messages = Vec::new();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM session_message WHERE session_id = ?1
+                 ORDER BY seq ASC, id ASC",
+            )
+            .context("failed to prepare OpenCode 2.x message query")?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>("id")?,
+                row.get::<_, String>("type")?,
+                Self::col::<i64>(row, "seq"),
+                Self::col::<i64>(row, "time_created"),
+                Self::col::<String>(row, "data"),
+            ))
+        })?;
+
+        for row in rows {
+            let (message_id, message_type, seq, row_time_created, data_json) = row?;
+            let mut data = data_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let timestamp = data
+                .pointer("/time/created")
+                .and_then(serde_json::Value::as_i64)
+                .or(row_time_created)
+                .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)));
+            if let Some(ts) = timestamp {
+                started_at = Some(started_at.map_or(ts, |current| current.min(ts)));
+                ended_at = Some(ended_at.map_or(ts, |current| current.max(ts)));
+            }
+            if let Some(completed) = data
+                .pointer("/time/completed")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|ts| parse_timestamp(&serde_json::Value::from(ts)))
+            {
+                ended_at = Some(ended_at.map_or(completed, |current| current.max(completed)));
+            }
+
+            let Some(turn) = map_v2_message(&message_type, &data) else {
+                trace!(
+                    message_id,
+                    message_type, "skipping OpenCode 2.x bookkeeping or empty entry"
+                );
+                continue;
+            };
+
+            if turn.role == MessageRole::Assistant
+                && let Some(model_id) = &turn.author
+            {
+                *model_counts.entry(model_id.clone()).or_insert(0) += 1;
+            }
+
+            // Attachment payloads are inline base64 (often megabytes); keep
+            // the attachment structure in `extra` but not the bytes.
+            strip_v2_attachment_payloads(&mut data);
+
+            messages.push(CanonicalMessage {
+                idx: 0,
+                role: turn.role,
+                content: turn.content,
+                timestamp,
+                author: turn.author,
+                tool_calls: turn.tool_calls,
+                tool_results: turn.tool_results,
+                extra: serde_json::json!({
+                    "opencode_message_id": message_id,
+                    "opencode_message_type": message_type,
+                    "opencode_seq": seq,
+                    "opencode_message": data,
+                }),
+            });
+        }
+
+        reindex_messages(&mut messages);
+
+        let title = session_row
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| truncate_title(&m.content, 80))
+                    .filter(|t| !t.is_empty())
+            });
+
+        let session_model = session_row
+            .model_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .filter(serde_json::Value::is_object);
+        let model_name = model_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(name, _)| name)
+            .or_else(|| {
+                session_model
+                    .as_ref()
+                    .and_then(|model| model.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(ToString::to_string)
+            });
+
+        let workspace = session_row
+            .directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Self::workspace_from_db_path(db_path));
+
+        Ok(CanonicalSession {
+            session_id: session_id.to_string(),
+            provider_slug: "opencode".to_string(),
+            workspace,
+            title,
+            started_at,
+            ended_at,
+            messages,
+            metadata: serde_json::json!({
+                "opencode_db": db_path.display().to_string(),
+                "opencode_schema": DbSchema::V2.metadata_tag(),
+                "parent_session_id": session_row.parent_id,
+                "fork_session_id": session_row.fork_session_id,
+                "project_id": session_row.project_id,
+                "workspace_id": session_row.workspace_id,
+                "directory": session_row.directory,
+                "slug": session_row.slug,
+                "opencode_version": session_row.version,
+                "agent": session_row.agent,
+                "model": session_model,
+                "prompt_tokens": session_row.tokens_input.unwrap_or(0),
+                "completion_tokens": session_row.tokens_output.unwrap_or(0),
+                "reasoning_tokens": session_row.tokens_reasoning.unwrap_or(0),
+                "cache_read_tokens": session_row.tokens_cache_read.unwrap_or(0),
+                "cache_write_tokens": session_row.tokens_cache_write.unwrap_or(0),
+                "cost": session_row.cost.unwrap_or(0.0),
+                "time_created": session_row.time_created,
+                "time_updated": session_row.time_updated,
+                "time_archived": session_row.time_archived,
+            }),
+            source_path: Self::virtual_session_path(db_path, session_id),
+            model_name,
+        })
     }
 
     /// Read a session from the OpenCode 1.x singular schema.
@@ -947,20 +1246,16 @@ impl Provider for OpenCode {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let db_path = Self::choose_target_db_path(session)?;
-        let mut conn = Self::open_db_rw(&db_path)?;
 
-        // Never graft the legacy plural tables into a live OpenCode 1.x DB:
-        // its `session`/`message`/`part` rows are projections of an event
-        // log, so rows inserted behind its back would not be picked up and
-        // would leave the DB with two disagreeing schemas.
-        if matches!(Self::detect_schema(&conn, &db_path), Ok(DbSchema::V1)) {
-            anyhow::bail!(
-                "OpenCode DB {} uses the 1.x event-sourced schema (session/message/part); \
-                 casr can read it but does not write into it. Point OPENCODE_DB_PATH at a \
-                 separate database, or use a different target provider.",
-                db_path.display()
-            );
+        // Never graft the legacy plural tables into a live OpenCode 1.x or
+        // 2.x DB (see `DbSchema::write_refusal_reason`). Probe with a
+        // read-only connection so the refusal itself never touches the file.
+        if db_path.is_file() {
+            let probe = Self::open_db(&db_path)?;
+            Self::refuse_read_only_schema(&probe, &db_path)?;
         }
+
+        let mut conn = Self::open_db_rw(&db_path)?;
         Self::ensure_schema(&conn)?;
 
         let has_count_trigger =
@@ -1408,6 +1703,413 @@ fn parse_v1_parts(parts: &serde_json::Value) -> (String, Vec<ToolCall>, Vec<Tool
     }
 
     (content, tool_calls, tool_results)
+}
+
+/// One row of the OpenCode 2.x `session_v2` table, pulled by column name so
+/// beta revisions that lack some columns still read.
+#[derive(Debug)]
+struct V2SessionRow {
+    /// Nullable in 2.x (a fresh session has no title until one is generated).
+    title: Option<String>,
+    directory: Option<String>,
+    parent_id: Option<String>,
+    fork_session_id: Option<String>,
+    project_id: Option<String>,
+    workspace_id: Option<String>,
+    slug: Option<String>,
+    version: Option<String>,
+    agent: Option<String>,
+    /// Raw JSON of the `model` column: `{"providerID":…,"id":…,"variant"?:…}`.
+    model_json: Option<String>,
+    cost: Option<f64>,
+    tokens_input: Option<i64>,
+    tokens_output: Option<i64>,
+    tokens_reasoning: Option<i64>,
+    tokens_cache_read: Option<i64>,
+    tokens_cache_write: Option<i64>,
+    time_created: Option<i64>,
+    time_updated: Option<i64>,
+    time_archived: Option<i64>,
+}
+
+/// The canonical projection of one OpenCode 2.x `session_message` row.
+#[derive(Debug)]
+struct V2Turn {
+    role: MessageRole,
+    content: String,
+    author: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    tool_results: Vec<ToolResult>,
+}
+
+impl V2Turn {
+    fn text(role: MessageRole, content: String) -> Self {
+        Self {
+            role,
+            content,
+            author: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.content.trim().is_empty() && self.tool_calls.is_empty() && self.tool_results.is_empty()
+    }
+}
+
+/// Map one OpenCode 2.x `session_message` row (its `type` column and `data`
+/// blob) onto a canonical turn, or `None` for bookkeeping rows and entries
+/// with nothing to replay (see [`OpenCode::read_v2_session`] for the table).
+fn map_v2_message(message_type: &str, data: &serde_json::Value) -> Option<V2Turn> {
+    let text = |key: &str| {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let turn = match message_type {
+        "user" => {
+            let mut chunks: Vec<String> = Vec::new();
+            let prompt = text("text");
+            if !prompt.trim().is_empty() {
+                chunks.push(prompt);
+            }
+            // Attachments are inline base64 in `files[]`; keep them visible
+            // as short markers the way the 1.x reader does for file parts.
+            for file in data
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let label = file
+                    .get("name")
+                    .or_else(|| file.pointer("/source/uri"))
+                    .or_else(|| file.get("mime"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("attachment");
+                chunks.push(format!("[file: {label}]"));
+            }
+            V2Turn::text(MessageRole::User, chunks.join("\n"))
+        }
+        "assistant" => {
+            let (content, tool_calls, tool_results) =
+                parse_v2_assistant_content(data.get("content").unwrap_or(&serde_json::Value::Null));
+            V2Turn {
+                role: MessageRole::Assistant,
+                content,
+                author: data
+                    .pointer("/model/id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(ToString::to_string),
+                tool_calls,
+                tool_results,
+            }
+        }
+        "system" => V2Turn::text(MessageRole::System, text("text")),
+        // Injected context (shell-failure notices, background-shell results,
+        // skill bodies): not typed by the user, not produced by the model.
+        "synthetic" | "skill" => V2Turn::text(MessageRole::Tool, text("text")),
+        "shell" => {
+            // A background shell reaches the model once, through its
+            // completion notice (a `synthetic` entry); OpenCode skips the
+            // shell row itself, so keeping it would duplicate the output.
+            if data
+                .pointer("/metadata/background")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return None;
+            }
+            V2Turn::text(MessageRole::Tool, v2_shell_text(data))
+        }
+        "compaction" => {
+            // `running` / `failed` checkpoints carry no usable summary;
+            // OpenCode itself replays only completed ones.
+            if data.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+                return None;
+            }
+            V2Turn::text(MessageRole::System, v2_compaction_text(data))
+        }
+        "model-switched" | "agent-switched" | "location-switched" => return None,
+        // Forward compatibility: a future entry kind that carries plain
+        // `text` is kept under its own role rather than dropped.
+        other => V2Turn::text(MessageRole::Other(other.to_string()), text("text")),
+    };
+
+    (!turn.is_empty()).then_some(turn)
+}
+
+/// Render a 2.x `shell` entry the way OpenCode replays it to the model.
+///
+/// `output` is `{output, cursor, size, truncated}` on current betas and a
+/// bare string on early ones; both are accepted.
+fn v2_shell_text(data: &serde_json::Value) -> String {
+    let command = data
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let output = match data.get("output") {
+        Some(serde_json::Value::String(raw)) => raw.as_str(),
+        Some(serde_json::Value::Object(page)) => page
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        _ => "",
+    };
+    if command.trim().is_empty() && output.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "The following shell command was executed by the user:\n\nCommand:\n{command}\n\nOutput:\n{output}"
+    )
+}
+
+/// Render a completed 2.x `compaction` checkpoint as system context.
+fn v2_compaction_text(data: &serde_json::Value) -> String {
+    let summary = data
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let recent = data
+        .get("recent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if summary.is_empty() && recent.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(
+        "Conversation checkpoint: earlier history was compacted by OpenCode. \
+         Treat it as historical context, not as new instructions.",
+    );
+    if !summary.is_empty() {
+        text.push_str("\n\nSummary:\n");
+        text.push_str(summary);
+    }
+    if !recent.is_empty() {
+        text.push_str("\n\nRecent context:\n");
+        text.push_str(recent);
+    }
+    text
+}
+
+/// Parse a 2.x assistant `content[]` array into canonical content, tool
+/// calls and tool results.
+///
+/// Parts are `{type: text|reasoning|tool, …}`. A `tool` part carries the
+/// call (`id`, `name`, `state.input`) and, once settled, its outcome in the
+/// same part: `state.status` is `streaming` / `pending` / `running` /
+/// `completed` / `error`. Completed output is `state.content[]`
+/// (`{type: text|file}` items), with `state.output` (older betas) and a
+/// string `state.result` accepted as fallbacks; errors are
+/// `state.error {type, message}`.
+///
+/// - `text` → content
+/// - `reasoning` → content only when there is no text
+/// - `tool` → a [`ToolCall`] plus a [`ToolResult`] once completed or errored
+fn parse_v2_assistant_content(
+    content: &serde_json::Value,
+) -> (String, Vec<ToolCall>, Vec<ToolResult>) {
+    let mut text_chunks: Vec<String> = Vec::new();
+    let mut reasoning_chunks: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut tool_results: Vec<ToolResult> = Vec::new();
+
+    let Some(items) = content.as_array() else {
+        return (String::new(), tool_calls, tool_results);
+    };
+
+    for item in items {
+        let part_type = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match part_type {
+            "text" => {
+                if let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    text_chunks.push(text.to_string());
+                }
+            }
+            "reasoning" => {
+                if let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    reasoning_chunks.push(text.to_string());
+                }
+            }
+            "tool" => {
+                let state = item.get("state").unwrap_or(&serde_json::Value::Null);
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("tool")
+                    .to_string();
+                let call_id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(ToString::to_string);
+                // `input` is the raw partial-JSON string while streaming and
+                // the parsed object once the call is admitted.
+                let arguments = match state.get("input") {
+                    Some(serde_json::Value::String(raw)) => parse_tool_call_arguments(raw),
+                    Some(serde_json::Value::Null) | None => serde_json::json!({}),
+                    Some(other) => other.clone(),
+                };
+                tool_calls.push(ToolCall {
+                    id: call_id.clone(),
+                    name,
+                    arguments,
+                });
+
+                let status = state
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match status {
+                    "completed" => tool_results.push(ToolResult {
+                        call_id,
+                        content: render_v2_tool_output(state),
+                        is_error: false,
+                    }),
+                    "error" => {
+                        let mut content = v2_error_text(state.get("error"));
+                        let output = render_v2_tool_output(state);
+                        if !output.trim().is_empty() {
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content.push_str(&output);
+                        }
+                        tool_results.push(ToolResult {
+                            call_id,
+                            content,
+                            is_error: true,
+                        });
+                    }
+                    // `streaming` / `pending` / `running`: no outcome yet.
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut content = text_chunks.join("\n");
+    if content.trim().is_empty() {
+        content = reasoning_chunks.join("\n");
+    }
+    if content.trim().is_empty() {
+        let result_texts: Vec<&str> = tool_results
+            .iter()
+            .map(|result| result.content.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        content = result_texts.join("\n");
+    }
+
+    (content, tool_calls, tool_results)
+}
+
+/// Text of a settled 2.x tool state: `content[]` items (`text` → the text,
+/// `file` → a `[file: …]` marker), else the older `output` string, else a
+/// string `result`.
+fn render_v2_tool_output(state: &serde_json::Value) -> String {
+    let from_content: Vec<String> = state
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(
+            |item| match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(ToString::to_string),
+                Some("file") => Some(format!(
+                    "[file: {}]",
+                    item.get("name")
+                        .or_else(|| item.get("uri"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("attachment")
+                )),
+                _ => item
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(ToString::to_string),
+            },
+        )
+        .collect();
+    if !from_content.is_empty() {
+        return from_content.join("\n");
+    }
+    if let Some(output) = state.get("output").and_then(serde_json::Value::as_str)
+        && !output.trim().is_empty()
+    {
+        return output.to_string();
+    }
+    state
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Human-readable text of a 2.x structured error (`{type, message, status?}`),
+/// tolerating a bare string.
+fn v2_error_text(error: Option<&serde_json::Value>) -> String {
+    match error {
+        Some(serde_json::Value::String(message)) => message.clone(),
+        Some(serde_json::Value::Object(fields)) => {
+            let message = fields
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let kind = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match (kind.is_empty(), message.is_empty()) {
+                (false, false) => format!("{kind}: {message}"),
+                (true, false) => message.to_string(),
+                (false, true) => kind.to_string(),
+                (true, true) => String::new(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Drop inline attachment bytes (`files[].data`, base64) from a 2.x user
+/// payload before it is kept in `CanonicalMessage::extra`.
+fn strip_v2_attachment_payloads(data: &mut serde_json::Value) {
+    if let Some(files) = data
+        .get_mut("files")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for file in files
+            .iter_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            if let Some(serde_json::Value::String(bytes)) = file.remove("data") {
+                file.insert(
+                    "data_omitted_bytes".to_string(),
+                    serde_json::Value::from(bytes.len()),
+                );
+            }
+        }
+    }
 }
 
 fn build_parts(message: &CanonicalMessage) -> serde_json::Value {
@@ -2740,5 +3442,989 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
 
         let listed = OpenCode.list_sessions().expect("should return Some");
         assert!(listed.is_empty(), "empty DB should have no sessions");
+    }
+
+    // ── OpenCode 2.x (session_v2 / session_message, issue #30) ───────────
+
+    const V2_SESSION_ID: &str = "ses_2a7c9e4f1b3d5aLiVeTwO";
+    const V2_OLDER_SESSION_ID: &str = "ses_1b6d8f3e2c4a6aOlDeRtWo";
+    const V2_CHILD_SESSION_ID: &str = "ses_3c8e0a5f4d6b7aChIlDtWo";
+
+    /// Create the OpenCode 2.x tables (columns per upstream
+    /// `packages/core/src/session/sql.ts` on the `beta` branch).
+    fn create_v2_tables(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
+CREATE TABLE session_v2 (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    workspace_id TEXT, parent_id TEXT, fork_session_id TEXT, fork_boundary TEXT,
+    slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT, version TEXT NOT NULL,
+    share_url TEXT, summary_additions INTEGER, summary_deletions INTEGER, summary_files INTEGER,
+    summary_diffs TEXT, metadata TEXT,
+    cost REAL NOT NULL DEFAULT 0,
+    tokens_input INTEGER NOT NULL DEFAULT 0, tokens_output INTEGER NOT NULL DEFAULT 0,
+    tokens_reasoning INTEGER NOT NULL DEFAULT 0, tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    revert TEXT, permission TEXT, agent TEXT, model TEXT,
+    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+    time_idle INTEGER, time_viewed INTEGER, idle_outcome TEXT, time_compacting INTEGER,
+    time_archived INTEGER, time_suspended INTEGER, resume_attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE session_message (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
+    type TEXT NOT NULL, seq INTEGER NOT NULL,
+    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+INSERT INTO project (id, worktree, name) VALUES ('prj_2', '/work', 'work');
+"#,
+        )
+        .expect("create 2.x fixture schema");
+    }
+
+    fn insert_v2_session(
+        conn: &Connection,
+        id: &str,
+        parent_id: Option<&str>,
+        title: Option<&str>,
+        directory: &str,
+        created: i64,
+        updated: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version,
+                agent, model, cost, tokens_input, tokens_output, tokens_reasoning,
+                tokens_cache_read, tokens_cache_write, time_created, time_updated)
+             VALUES (?1, 'prj_2', ?2, ?3, ?4, ?5, '2.0.0-beta.19187', 'build',
+                '{\"providerID\":\"anthropic\",\"id\":\"claude-sonnet-4\",\"variant\":\"max\"}',
+                0.42, 1200, 340, 55, 900, 100, ?6, ?7)",
+            rusqlite::params![
+                id,
+                parent_id,
+                format!("slug-{id}"),
+                directory,
+                title,
+                created,
+                updated
+            ],
+        )
+        .expect("insert session_v2 row");
+    }
+
+    fn insert_v2_message(
+        conn: &Connection,
+        session_id: &str,
+        id: &str,
+        message_type: &str,
+        seq: i64,
+        time_created: i64,
+        data: &serde_json::Value,
+    ) {
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            rusqlite::params![
+                id,
+                session_id,
+                message_type,
+                seq,
+                time_created,
+                serde_json::to_string(data).unwrap()
+            ],
+        )
+        .expect("insert session_message row");
+    }
+
+    /// The live 2.x transcript used by the fixture: one row per entry kind
+    /// OpenCode 2 writes, in `seq` order. Payload shapes follow upstream
+    /// `packages/schema/src/session-message.ts` (`beta` branch).
+    fn v2_transcript_rows(directory: &str) -> Vec<(&'static str, &'static str, serde_json::Value)> {
+        vec![
+            (
+                "msg_v2_agent",
+                "agent-switched",
+                serde_json::json!({"agent": "build", "time": {"created": 1_700_000_000_500_i64}}),
+            ),
+            (
+                "msg_v2_model",
+                "model-switched",
+                serde_json::json!({
+                    "model": {"providerID": "anthropic", "id": "claude-sonnet-4", "variant": "max"},
+                    "time": {"created": 1_700_000_000_600_i64}
+                }),
+            ),
+            (
+                "msg_v2_user1",
+                "user",
+                serde_json::json!({
+                    "text": "Please inspect src/main.rs",
+                    "files": [{
+                        "data": "QUJDREVGR0g=",
+                        "mime": "image/png",
+                        "source": {"type": "inline"},
+                        "name": "screenshot.png"
+                    }],
+                    "time": {"created": 1_700_000_001_000_i64}
+                }),
+            ),
+            (
+                "msg_v2_asst1",
+                "assistant",
+                serde_json::json!({
+                    "agent": "build",
+                    "model": {"providerID": "anthropic", "id": "claude-sonnet-4", "variant": "max"},
+                    "content": [
+                        {"type": "reasoning", "text": "Need to read the file first."},
+                        {
+                            "type": "tool",
+                            "id": "call_v2_1",
+                            "name": "read",
+                            "executed": true,
+                            "state": {
+                                "status": "completed",
+                                "input": {"filePath": "src/main.rs"},
+                                "content": [{"type": "text", "text": "fn main() {}"}],
+                                "metadata": {}
+                            },
+                            "time": {"created": 1_700_000_005_500_i64, "completed": 1_700_000_006_000_i64}
+                        },
+                        {
+                            "type": "tool",
+                            "id": "call_v2_2",
+                            "name": "bash",
+                            "executed": true,
+                            "state": {
+                                "status": "error",
+                                "input": {"command": "cat missing.txt"},
+                                "error": {"type": "Tool.Error", "message": "cat: missing.txt: No such file"}
+                            },
+                            "time": {"created": 1_700_000_006_100_i64, "completed": 1_700_000_006_500_i64}
+                        },
+                        {"type": "text", "text": "Inspecting now."}
+                    ],
+                    "cost": 0.01,
+                    "tokens": {"input": 10, "output": 20, "reasoning": 5, "cache": {"read": 0, "write": 0}},
+                    "time": {"created": 1_700_000_005_000_i64, "completed": 1_700_000_009_000_i64}
+                }),
+            ),
+            (
+                "msg_v2_shell",
+                "shell",
+                serde_json::json!({
+                    "shellID": "sh_1",
+                    "command": "ls src",
+                    "status": "exited",
+                    "exit": 0,
+                    "output": {"output": "main.rs\nlib.rs", "cursor": 14, "size": 14, "truncated": false},
+                    "time": {"created": 1_700_000_010_000_i64, "completed": 1_700_000_010_200_i64}
+                }),
+            ),
+            (
+                "msg_v2_synth",
+                "synthetic",
+                serde_json::json!({
+                    "text": "User shell command failed to start:\nfrobnicate\n\ncommand not found",
+                    "description": "frobnicate",
+                    "metadata": {"source": "shell", "state": "error"},
+                    "time": {"created": 1_700_000_011_000_i64}
+                }),
+            ),
+            (
+                "msg_v2_location",
+                "location-switched",
+                serde_json::json!({
+                    "location": {"directory": directory},
+                    "time": {"created": 1_700_000_011_500_i64}
+                }),
+            ),
+            (
+                "msg_v2_system",
+                "system",
+                serde_json::json!({
+                    "text": "AGENTS.md changed: run cargo fmt before committing.",
+                    "description": "instructions updated",
+                    "time": {"created": 1_700_000_012_000_i64}
+                }),
+            ),
+            (
+                "msg_v2_compact_running",
+                "compaction",
+                serde_json::json!({
+                    "status": "running",
+                    "reason": "auto",
+                    "summary": "",
+                    "recent": "",
+                    "time": {"created": 1_700_000_012_500_i64}
+                }),
+            ),
+            (
+                "msg_v2_compact",
+                "compaction",
+                serde_json::json!({
+                    "status": "completed",
+                    "reason": "auto",
+                    "summary": "We inspected src/main.rs and found an empty main.",
+                    "recent": "User asked to inspect src/main.rs.",
+                    "time": {"created": 1_700_000_013_000_i64}
+                }),
+            ),
+            (
+                "msg_v2_user2",
+                "user",
+                serde_json::json!({
+                    "text": "Now add a hello world.",
+                    "time": {"created": 1_700_000_014_000_i64}
+                }),
+            ),
+            (
+                "msg_v2_asst2",
+                "assistant",
+                serde_json::json!({
+                    "agent": "build",
+                    "model": {"providerID": "openai", "id": "gpt-5", "variant": "high"},
+                    "content": [
+                        {
+                            "type": "tool",
+                            "id": "call_v2_3",
+                            "name": "edit",
+                            "state": {"status": "running", "input": {"filePath": "src/main.rs"}, "metadata": {}},
+                            "time": {"created": 1_700_000_015_500_i64}
+                        }
+                    ],
+                    "time": {"created": 1_700_000_015_000_i64}
+                }),
+            ),
+        ]
+    }
+
+    /// Build a fixture DB carrying ONLY the OpenCode 2.x schema
+    /// (`session_v2` + `session_message`), populated with a live session, an
+    /// older root session, and a child (sub-agent) session.
+    fn create_v2_schema_db(db_path: &Path, directory: &Path) {
+        let conn = Connection::open(db_path).expect("create fixture db");
+        create_v2_tables(&conn);
+        populate_v2_sessions(&conn, directory);
+    }
+
+    fn populate_v2_sessions(conn: &Connection, directory: &Path) {
+        let dir = directory.display().to_string();
+        insert_v2_session(
+            conn,
+            V2_SESSION_ID,
+            None,
+            Some("live 2.x session"),
+            &dir,
+            1_700_000_000_000,
+            1_700_000_020_000,
+        );
+        insert_v2_session(
+            conn,
+            V2_OLDER_SESSION_ID,
+            None,
+            None,
+            &dir,
+            1_600_000_000_000,
+            1_600_000_001_000,
+        );
+        insert_v2_session(
+            conn,
+            V2_CHILD_SESSION_ID,
+            Some(V2_SESSION_ID),
+            Some("child"),
+            &dir,
+            1_700_000_030_000,
+            1_700_000_031_000,
+        );
+
+        for (seq, (id, message_type, data)) in v2_transcript_rows(&dir).into_iter().enumerate() {
+            let created = data
+                .pointer("/time/created")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap();
+            insert_v2_message(
+                conn,
+                V2_SESSION_ID,
+                id,
+                message_type,
+                i64::try_from(seq).unwrap() + 1,
+                created,
+                &data,
+            );
+        }
+        insert_v2_message(
+            conn,
+            V2_OLDER_SESSION_ID,
+            "msg_v2_old1",
+            "user",
+            1,
+            1_600_000_000_000,
+            &serde_json::json!({"text": "older 2.x prompt", "time": {"created": 1_600_000_000_000_i64}}),
+        );
+        insert_v2_message(
+            conn,
+            V2_CHILD_SESSION_ID,
+            "msg_v2_child1",
+            "user",
+            1,
+            1_700_000_030_000,
+            &serde_json::json!({"text": "child prompt", "time": {"created": 1_700_000_030_000_i64}}),
+        );
+    }
+
+    /// Build a fixture DB as OpenCode 2 leaves it after migrating a 1.x DB:
+    /// the stale 1.x `session`/`message`/`part` tables are still present
+    /// (with their pre-migration sessions) next to the live 2.x tables.
+    fn create_migrated_v1_v2_db(db_path: &Path, directory: &Path) {
+        create_v1_schema_db(db_path, directory);
+        let conn = Connection::open(db_path).expect("open fixture db");
+        create_v2_tables(&conn);
+        populate_v2_sessions(&conn, directory);
+    }
+
+    #[test]
+    fn detect_schema_recognizes_2x_layout() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_v2_schema_db(&db_path, tmp.path());
+        let conn = OpenCode::open_db(&db_path).expect("open db");
+        assert_eq!(
+            OpenCode::detect_schema(&conn, &db_path).expect("2.x schema must be detected"),
+            DbSchema::V2
+        );
+        assert!(!DbSchema::V2.writable());
+    }
+
+    #[test]
+    fn detect_schema_prefers_2x_over_stale_1x_tables_in_migrated_db() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_migrated_v1_v2_db(&db_path, tmp.path());
+        let conn = OpenCode::open_db(&db_path).expect("open db");
+
+        assert!(OpenCode::table_exists(&conn, "session"), "fixture premise");
+        assert!(OpenCode::table_exists(&conn, "part"), "fixture premise");
+        assert_eq!(
+            OpenCode::detect_schema(&conn, &db_path).expect("migrated DB must read"),
+            DbSchema::V2,
+            "a migrated DB must be read through the live 2.x tables"
+        );
+
+        // Listing and the newest-root lookup go through the 2.x tables too,
+        // so the dead pre-migration sessions never surface.
+        let ids = OpenCode::all_session_ids(&conn, DbSchema::V2);
+        assert!(ids.contains(&V2_SESSION_ID.to_string()));
+        assert!(!ids.contains(&V1_SESSION_ID.to_string()));
+        assert_eq!(
+            OpenCode::newest_root_session_id(&conn, DbSchema::V2).as_deref(),
+            Some(V2_SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn detect_schema_diagnostic_names_2x_when_only_session_v2_present() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("create fixture db");
+        conn.execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT);")
+            .expect("populate fixture schema");
+        let msg = OpenCode::schema_mismatch(&conn, &db_path).expect("partial 2.x must mismatch");
+        assert!(msg.contains("closest is the 2.x schema"), "got: {msg}");
+        assert!(
+            msg.contains("missing table(s): session_message"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_session_by_virtual_path_on_2x_schema_maps_every_entry_kind() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        create_v2_schema_db(&db_path, &workspace);
+
+        let virtual_path = OpenCode::virtual_session_path(&db_path, V2_SESSION_ID);
+        let session = OpenCode
+            .read_session(&virtual_path)
+            .expect("2.x session must read");
+
+        assert_eq!(session.session_id, V2_SESSION_ID);
+        assert_eq!(session.provider_slug, "opencode");
+        assert_eq!(session.title.as_deref(), Some("live 2.x session"));
+        assert_eq!(session.workspace.as_deref(), Some(workspace.as_path()));
+        assert_eq!(session.started_at, Some(1_700_000_000_000));
+        assert_eq!(session.ended_at, Some(1_700_000_020_000));
+        assert_eq!(session.source_path, virtual_path);
+        // Two assistant turns on different models; the session model is the
+        // one that produced the most assistant turns, ties broken arbitrarily
+        // — here they tie, so accept either but require one of the two.
+        let model = session.model_name.as_deref().expect("model name");
+        assert!(matches!(model, "claude-sonnet-4" | "gpt-5"), "got {model}");
+
+        let meta = &session.metadata;
+        assert_eq!(meta["opencode_schema"], "v2");
+        assert_eq!(meta["opencode_version"], "2.0.0-beta.19187");
+        assert_eq!(meta["project_id"], "prj_2");
+        assert_eq!(meta["slug"], format!("slug-{V2_SESSION_ID}"));
+        assert_eq!(meta["agent"], "build");
+        assert_eq!(meta["model"]["providerID"], "anthropic");
+        assert_eq!(meta["model"]["id"], "claude-sonnet-4");
+        assert_eq!(meta["model"]["variant"], "max");
+        assert_eq!(meta["prompt_tokens"], 1200);
+        assert_eq!(meta["completion_tokens"], 340);
+        assert_eq!(meta["reasoning_tokens"], 55);
+        assert_eq!(meta["cache_read_tokens"], 900);
+        assert_eq!(meta["cache_write_tokens"], 100);
+        assert_eq!(meta["cost"], 0.42);
+        assert_eq!(meta["time_created"], 1_700_000_000_000_i64);
+        assert_eq!(meta["time_updated"], 1_700_000_020_000_i64);
+        assert!(meta["time_archived"].is_null());
+        assert!(meta["parent_session_id"].is_null());
+
+        // Bookkeeping rows (agent/model/location-switched) and the running
+        // compaction are skipped; everything else maps in `seq` order.
+        let roles: Vec<(&MessageRole, &str)> = session
+            .messages
+            .iter()
+            .map(|m| (&m.role, m.extra["opencode_message_type"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (&MessageRole::User, "user"),
+                (&MessageRole::Assistant, "assistant"),
+                (&MessageRole::Tool, "shell"),
+                (&MessageRole::Tool, "synthetic"),
+                (&MessageRole::System, "system"),
+                (&MessageRole::System, "compaction"),
+                (&MessageRole::User, "user"),
+                (&MessageRole::Assistant, "assistant"),
+            ]
+        );
+        for (i, m) in session.messages.iter().enumerate() {
+            assert_eq!(m.idx, i);
+        }
+
+        let user = &session.messages[0];
+        assert_eq!(
+            user.content,
+            "Please inspect src/main.rs\n[file: screenshot.png]"
+        );
+        assert_eq!(user.timestamp, Some(1_700_000_001_000));
+        assert_eq!(user.extra["opencode_message_id"], "msg_v2_user1");
+        assert_eq!(user.extra["opencode_seq"], 3);
+        assert!(
+            user.extra["opencode_message"]["files"][0]
+                .get("data")
+                .is_none(),
+            "inline attachment bytes must not be duplicated into extra"
+        );
+        assert_eq!(
+            user.extra["opencode_message"]["files"][0]["data_omitted_bytes"],
+            12
+        );
+        assert_eq!(
+            user.extra["opencode_message"]["files"][0]["name"],
+            "screenshot.png"
+        );
+
+        let assistant = &session.messages[1];
+        assert_eq!(assistant.content, "Inspecting now.");
+        assert_eq!(assistant.author.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(assistant.timestamp, Some(1_700_000_005_000));
+        assert_eq!(assistant.tool_calls.len(), 2);
+        assert_eq!(assistant.tool_calls[0].id.as_deref(), Some("call_v2_1"));
+        assert_eq!(assistant.tool_calls[0].name, "read");
+        assert_eq!(assistant.tool_calls[0].arguments["filePath"], "src/main.rs");
+        assert_eq!(assistant.tool_calls[1].id.as_deref(), Some("call_v2_2"));
+        assert_eq!(assistant.tool_calls[1].name, "bash");
+        assert_eq!(assistant.tool_results.len(), 2);
+        assert_eq!(
+            assistant.tool_results[0].call_id.as_deref(),
+            Some("call_v2_1")
+        );
+        assert_eq!(assistant.tool_results[0].content, "fn main() {}");
+        assert!(!assistant.tool_results[0].is_error);
+        assert_eq!(
+            assistant.tool_results[1].call_id.as_deref(),
+            Some("call_v2_2")
+        );
+        assert_eq!(
+            assistant.tool_results[1].content,
+            "Tool.Error: cat: missing.txt: No such file"
+        );
+        assert!(assistant.tool_results[1].is_error);
+        assert_eq!(
+            assistant.extra["opencode_message"]["model"]["variant"],
+            "max"
+        );
+
+        let shell = &session.messages[2];
+        assert_eq!(
+            shell.content,
+            "The following shell command was executed by the user:\n\nCommand:\nls src\n\nOutput:\nmain.rs\nlib.rs"
+        );
+        assert_eq!(shell.extra["opencode_message"]["exit"], 0);
+
+        let synthetic = &session.messages[3];
+        assert!(
+            synthetic
+                .content
+                .starts_with("User shell command failed to start:")
+        );
+
+        let system = &session.messages[4];
+        assert_eq!(
+            system.content,
+            "AGENTS.md changed: run cargo fmt before committing."
+        );
+
+        let compaction = &session.messages[5];
+        assert!(compaction.content.starts_with("Conversation checkpoint:"));
+        assert!(
+            compaction
+                .content
+                .contains("Summary:\nWe inspected src/main.rs and found an empty main.")
+        );
+        assert!(
+            compaction
+                .content
+                .contains("Recent context:\nUser asked to inspect src/main.rs.")
+        );
+
+        let running_tool = &session.messages[7];
+        assert_eq!(running_tool.author.as_deref(), Some("gpt-5"));
+        assert_eq!(running_tool.tool_calls.len(), 1);
+        assert_eq!(running_tool.tool_calls[0].name, "edit");
+        assert!(
+            running_tool.tool_results.is_empty(),
+            "a running tool has no outcome yet"
+        );
+        assert_eq!(
+            running_tool.content, "",
+            "no text, no reasoning, no settled result"
+        );
+    }
+
+    #[test]
+    fn read_session_on_2x_db_path_picks_newest_root_session() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_v2_schema_db(&db_path, tmp.path());
+
+        // The child session is newer but has a parent; the live root wins.
+        let session = OpenCode
+            .read_session(&db_path)
+            .expect("direct db path must resolve to the newest root session");
+        assert_eq!(session.session_id, V2_SESSION_ID);
+    }
+
+    #[test]
+    fn read_session_on_2x_schema_untitled_session_derives_title_from_first_user_turn() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_v2_schema_db(&db_path, tmp.path());
+
+        let virtual_path = OpenCode::virtual_session_path(&db_path, V2_OLDER_SESSION_ID);
+        let session = OpenCode.read_session(&virtual_path).expect("older session");
+        assert_eq!(session.title.as_deref(), Some("older 2.x prompt"));
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.model_name.as_deref(),
+            Some("claude-sonnet-4"),
+            "no assistant turns: fall back to session_v2.model.id"
+        );
+        assert_eq!(
+            session.metadata["parent_session_id"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn read_session_on_2x_schema_child_session_records_parent() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_v2_schema_db(&db_path, tmp.path());
+
+        let virtual_path = OpenCode::virtual_session_path(&db_path, V2_CHILD_SESSION_ID);
+        let session = OpenCode.read_session(&virtual_path).expect("child session");
+        assert_eq!(session.metadata["parent_session_id"], V2_SESSION_ID);
+    }
+
+    #[test]
+    fn read_session_on_2x_schema_unknown_id_fails_naming_session() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_v2_schema_db(&db_path, tmp.path());
+
+        let virtual_path = OpenCode::virtual_session_path(&db_path, "ses_missing_v2");
+        let err = OpenCode
+            .read_session(&virtual_path)
+            .expect_err("unknown id must fail");
+        assert!(format!("{err:#}").contains("ses_missing_v2"));
+    }
+
+    #[test]
+    fn read_migrated_db_by_virtual_path_serves_2x_sessions_not_stale_1x_ones() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("opencode.db");
+        create_migrated_v1_v2_db(&db_path, tmp.path());
+
+        let live = OpenCode
+            .read_session(&OpenCode::virtual_session_path(&db_path, V2_SESSION_ID))
+            .expect("2.x session must read from a migrated DB");
+        assert_eq!(live.metadata["opencode_schema"], "v2");
+        assert_eq!(live.messages.len(), 8);
+
+        // Direct DB path → newest root through the 2.x tables.
+        let newest = OpenCode.read_session(&db_path).expect("newest root");
+        assert_eq!(newest.session_id, V2_SESSION_ID);
+
+        // The stale 1.x session id is not reachable: it only exists in the
+        // dead tables.
+        let err = OpenCode
+            .read_session(&OpenCode::virtual_session_path(&db_path, V1_SESSION_ID))
+            .expect_err("stale 1.x ids must not resolve");
+        assert!(format!("{err:#}").contains(V1_SESSION_ID));
+    }
+
+    #[test]
+    fn list_sessions_on_2x_schema_lists_every_session_newest_first() {
+        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
+        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
+        create_v2_schema_db(&db_path, &workspace);
+        let _cwd = CwdGuard::change_to(&workspace);
+
+        let listed = OpenCode.list_sessions().expect("should return Some");
+        let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![V2_CHILD_SESSION_ID, V2_SESSION_ID, V2_OLDER_SESSION_ID]
+        );
+
+        // `casr list` renders title / directory / time from a full read of
+        // each listed path, so every listed path must read.
+        for (id, path) in &listed {
+            let session = OpenCode.read_session(path).expect("listed session reads");
+            assert_eq!(&session.session_id, id);
+            assert!(session.title.is_some(), "{id} must carry a title");
+            assert_eq!(session.workspace.as_deref(), Some(workspace.as_path()));
+            assert!(session.started_at.is_some(), "{id} must carry a start time");
+        }
+
+        assert_eq!(
+            OpenCode.owns_session(V2_SESSION_ID),
+            Some(OpenCode::virtual_session_path(&db_path, V2_SESSION_ID))
+        );
+    }
+
+    #[test]
+    fn list_sessions_on_migrated_db_shows_only_2x_sessions() {
+        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
+        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
+        create_migrated_v1_v2_db(&db_path, &workspace);
+        let _cwd = CwdGuard::change_to(&workspace);
+
+        let listed = OpenCode.list_sessions().expect("should return Some");
+        let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![V2_CHILD_SESSION_ID, V2_SESSION_ID, V2_OLDER_SESSION_ID]
+        );
+        assert!(OpenCode.owns_session(V1_SESSION_ID).is_none());
+    }
+
+    #[test]
+    fn write_session_into_2x_db_is_refused_without_touching_the_file() {
+        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
+        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
+        create_v2_schema_db(&db_path, &workspace);
+        let before = std::fs::read(&db_path).expect("read db bytes");
+        let _cwd = CwdGuard::change_to(&workspace);
+
+        let err = OpenCode
+            .write_session(&sample_session(&workspace), &WriteOptions { force: true })
+            .expect_err("writing into a live 2.x DB must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("2.x"), "got: {msg}");
+        assert!(msg.contains("session_v2/session_message"), "got: {msg}");
+        assert!(msg.contains("projection"), "must explain why: {msg}");
+        assert!(
+            msg.contains("OPENCODE_DB_PATH"),
+            "must say what to do: {msg}"
+        );
+
+        assert_eq!(
+            std::fs::read(&db_path).expect("read db bytes"),
+            before,
+            "the refusal must leave the DB byte-identical"
+        );
+        let conn = OpenCode::open_db(&db_path).expect("open db");
+        assert!(!OpenCode::table_exists(&conn, "sessions"));
+        assert!(!OpenCode::table_exists(&conn, "messages"));
+    }
+
+    #[test]
+    fn write_session_into_migrated_db_is_refused_as_2x() {
+        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
+        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
+        create_migrated_v1_v2_db(&db_path, &workspace);
+        let _cwd = CwdGuard::change_to(&workspace);
+
+        let err = OpenCode
+            .write_session(&sample_session(&workspace), &WriteOptions { force: false })
+            .expect_err("writing into a migrated DB must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("2.x schema"), "got: {msg}");
+    }
+
+    #[test]
+    fn write_session_into_1x_db_leaves_file_byte_identical() {
+        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
+        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
+        create_v1_schema_db(&db_path, &workspace);
+        let before = std::fs::read(&db_path).expect("read db bytes");
+        let _cwd = CwdGuard::change_to(&workspace);
+
+        let err = OpenCode
+            .write_session(&sample_session(&workspace), &WriteOptions { force: false })
+            .expect_err("writing into a live 1.x DB must be refused");
+        assert!(format!("{err:#}").contains("1.x schema"));
+        assert_eq!(std::fs::read(&db_path).expect("read db bytes"), before);
+    }
+
+    // Round-trip conversion of a 2.x session into Claude Code lives in
+    // `tests/opencode_v2_test.rs`: the Claude Code writer needs `CLAUDE_HOME`,
+    // and env mutation is `unsafe` under this crate's `forbid(unsafe_code)`.
+
+    // ── map_v2_message / parse_v2_assistant_content ─────────────────────
+
+    #[test]
+    fn map_v2_message_user_with_only_attachment_keeps_marker() {
+        let data = serde_json::json!({
+            "text": "",
+            "files": [{"data": "AAAA", "mime": "image/png", "source": {"type": "inline"}}],
+            "time": {"created": 1_i64}
+        });
+        let turn = map_v2_message("user", &data).expect("attachment-only turn is kept");
+        assert_eq!(turn.role, MessageRole::User);
+        assert_eq!(turn.content, "[file: image/png]");
+    }
+
+    #[test]
+    fn map_v2_message_empty_user_and_empty_assistant_are_dropped() {
+        assert!(map_v2_message("user", &serde_json::json!({"text": "  "})).is_none());
+        assert!(map_v2_message("assistant", &serde_json::json!({"content": []})).is_none());
+        assert!(map_v2_message("system", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn map_v2_message_skips_bookkeeping_kinds() {
+        for kind in ["model-switched", "agent-switched", "location-switched"] {
+            assert!(
+                map_v2_message(kind, &serde_json::json!({"text": "ignored"})).is_none(),
+                "{kind} must be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn map_v2_message_compaction_only_when_completed() {
+        let running = serde_json::json!({"status": "running", "summary": "s", "recent": "r"});
+        assert!(map_v2_message("compaction", &running).is_none());
+        let failed =
+            serde_json::json!({"status": "failed", "error": {"type": "x", "message": "y"}});
+        assert!(map_v2_message("compaction", &failed).is_none());
+
+        let completed = serde_json::json!({"status": "completed", "summary": "s", "recent": ""});
+        let turn = map_v2_message("compaction", &completed).expect("completed");
+        assert_eq!(turn.role, MessageRole::System);
+        assert!(turn.content.ends_with("Summary:\ns"));
+        assert!(!turn.content.contains("Recent context"));
+    }
+
+    #[test]
+    fn map_v2_message_skill_and_synthetic_are_tool_turns() {
+        let skill = serde_json::json!({"skill": "sk_1", "name": "deploy", "text": "how to deploy"});
+        let turn = map_v2_message("skill", &skill).expect("skill");
+        assert_eq!(turn.role, MessageRole::Tool);
+        assert_eq!(turn.content, "how to deploy");
+
+        let synthetic = serde_json::json!({"text": "injected", "description": "d"});
+        let turn = map_v2_message("synthetic", &synthetic).expect("synthetic");
+        assert_eq!(turn.role, MessageRole::Tool);
+        assert_eq!(turn.content, "injected");
+    }
+
+    #[test]
+    fn map_v2_message_unknown_kind_with_text_keeps_its_own_role() {
+        let turn = map_v2_message("future-kind", &serde_json::json!({"text": "hello"}))
+            .expect("text-bearing unknown kind is kept");
+        assert_eq!(turn.role, MessageRole::Other("future-kind".to_string()));
+        assert!(map_v2_message("future-kind", &serde_json::json!({"x": 1})).is_none());
+    }
+
+    #[test]
+    fn map_v2_message_background_shell_is_skipped_foreground_kept() {
+        let background = serde_json::json!({
+            "command": "sleep 5", "status": "exited", "exit": 0,
+            "output": {"output": "done", "cursor": 4, "size": 4, "truncated": false},
+            "metadata": {"background": true}
+        });
+        assert!(
+            map_v2_message("shell", &background).is_none(),
+            "background shell output arrives via its synthetic completion notice"
+        );
+        let foreground = serde_json::json!({
+            "command": "pwd", "status": "exited", "exit": 0,
+            "output": {"output": "/work", "cursor": 5, "size": 5, "truncated": false},
+            "metadata": {"background": false}
+        });
+        let turn = map_v2_message("shell", &foreground).expect("foreground shell");
+        assert_eq!(turn.role, MessageRole::Tool);
+        assert!(turn.content.ends_with("Output:\n/work"));
+    }
+
+    #[test]
+    fn v2_shell_text_accepts_string_and_paged_output() {
+        let early = serde_json::json!({"command": "pwd", "output": "/work"});
+        assert!(v2_shell_text(&early).ends_with("Command:\npwd\n\nOutput:\n/work"));
+        let paged = serde_json::json!({
+            "command": "pwd",
+            "output": {"output": "/work", "cursor": 5, "size": 5, "truncated": false}
+        });
+        assert_eq!(v2_shell_text(&paged), v2_shell_text(&early));
+        assert_eq!(v2_shell_text(&serde_json::json!({"status": "running"})), "");
+    }
+
+    #[test]
+    fn parse_v2_assistant_content_streaming_input_is_parsed_from_string() {
+        let content = serde_json::json!([{
+            "type": "tool", "id": "c1", "name": "read",
+            "state": {"status": "streaming", "input": "{\"filePath\": \"a.rs\"}"}
+        }]);
+        let (text, calls, results) = parse_v2_assistant_content(&content);
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["filePath"], "a.rs");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_v2_assistant_content_completed_output_fallbacks() {
+        // Current betas: content[] with text and file items.
+        let content = serde_json::json!([{
+            "type": "tool", "id": "c1", "name": "read",
+            "state": {"status": "completed", "input": {},
+                      "content": [{"type": "text", "text": "hello"},
+                                  {"type": "file", "uri": "file:///tmp/x.png", "mime": "image/png", "name": "x.png"}]}
+        }]);
+        let (text, _, results) = parse_v2_assistant_content(&content);
+        assert_eq!(results[0].content, "hello\n[file: x.png]");
+        assert_eq!(
+            text, "hello\n[file: x.png]",
+            "result text stands in when there is no assistant text"
+        );
+
+        // Older betas: a bare `output` string.
+        let content = serde_json::json!([{
+            "type": "tool", "id": "c1", "name": "read",
+            "state": {"status": "completed", "input": {}, "output": "legacy output"}
+        }]);
+        let (_, _, results) = parse_v2_assistant_content(&content);
+        assert_eq!(results[0].content, "legacy output");
+
+        // Empty content[] but a string result.
+        let content = serde_json::json!([{
+            "type": "tool", "id": "c1", "name": "read",
+            "state": {"status": "completed", "input": {}, "content": [], "result": "from result"}
+        }]);
+        let (_, _, results) = parse_v2_assistant_content(&content);
+        assert_eq!(results[0].content, "from result");
+    }
+
+    #[test]
+    fn parse_v2_assistant_content_error_keeps_partial_output() {
+        let content = serde_json::json!([{
+            "type": "tool", "id": "c1", "name": "bash",
+            "state": {"status": "error", "input": {"command": "x"},
+                      "error": {"type": "Tool.Error", "message": "boom", "status": 500},
+                      "content": [{"type": "text", "text": "partial stdout"}]}
+        }]);
+        let (_, calls, results) = parse_v2_assistant_content(&content);
+        assert_eq!(calls[0].arguments["command"], "x");
+        assert!(results[0].is_error);
+        assert_eq!(results[0].content, "Tool.Error: boom\npartial stdout");
+    }
+
+    #[test]
+    fn parse_v2_assistant_content_text_preferred_over_reasoning_and_unknown_parts_skipped() {
+        let content = serde_json::json!([
+            {"type": "reasoning", "text": "thinking"},
+            {"type": "text", "text": "answer"},
+            {"type": "mystery", "text": "nope"}
+        ]);
+        let (text, calls, results) = parse_v2_assistant_content(&content);
+        assert_eq!(text, "answer");
+        assert!(calls.is_empty() && results.is_empty());
+
+        let (text, _, _) = parse_v2_assistant_content(
+            &serde_json::json!([{"type": "reasoning", "text": "thinking"}]),
+        );
+        assert_eq!(text, "thinking");
+
+        let (text, calls, results) =
+            parse_v2_assistant_content(&serde_json::json!({"not": "array"}));
+        assert!(text.is_empty() && calls.is_empty() && results.is_empty());
+    }
+
+    #[test]
+    fn v2_error_text_shapes() {
+        assert_eq!(v2_error_text(None), "");
+        assert_eq!(v2_error_text(Some(&serde_json::json!("plain"))), "plain");
+        assert_eq!(
+            v2_error_text(Some(&serde_json::json!({"type": "T", "message": "m"}))),
+            "T: m"
+        );
+        assert_eq!(
+            v2_error_text(Some(&serde_json::json!({"message": "m"}))),
+            "m"
+        );
+        assert_eq!(v2_error_text(Some(&serde_json::json!({"type": "T"}))), "T");
+        assert_eq!(v2_error_text(Some(&serde_json::json!({}))), "");
+    }
+
+    #[test]
+    fn strip_v2_attachment_payloads_only_touches_file_data() {
+        let mut data = serde_json::json!({
+            "text": "t",
+            "files": [{"data": "QUJD", "mime": "image/png", "name": "a.png"}, {"mime": "x"}],
+            "other": {"data": "keep"}
+        });
+        strip_v2_attachment_payloads(&mut data);
+        assert!(data["files"][0].get("data").is_none());
+        assert_eq!(data["files"][0]["data_omitted_bytes"], 4);
+        assert_eq!(data["files"][0]["name"], "a.png");
+        assert_eq!(data["files"][1], serde_json::json!({"mime": "x"}));
+        assert_eq!(data["other"]["data"], "keep");
     }
 }

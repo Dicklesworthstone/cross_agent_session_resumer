@@ -92,7 +92,7 @@ claude --resume <new-session-id>
 | Cline | `cln` | Yes | Yes | `code .` |
 | Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
 | Amp | `amp` | Yes | Yes | `amp threads continue --execute "Continue from @<session-id>"` |
-| OpenCode | `opc` | Yes | Yes | `opencode` |
+| OpenCode | `opc` | Yes | Legacy DBs only | `opencode` |
 | ChatGPT | `gpt` | Yes | Yes | `open "https://chatgpt.com/c/<session-id>"` |
 | ClawdBot | `cwb` | Yes | Yes | `clawdbot --resume <session-id>` |
 | Vibe | `vib` | Yes | Yes | `vibe --resume <session-id>` |
@@ -106,6 +106,7 @@ Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
 - Additional providers are implemented through the same `Provider` trait model.
 - Grok Build (xAI's official `grok` CLI) is read and write: casr synthesizes the native session tree (`updates.jsonl` + `summary.json`), which was round-trip verified against a live `grok --resume` (the CLI lists, exports, and resumes casr-written sessions with full conversation context).
+- OpenCode's `opencode.db` comes in three layouts, detected from `sqlite_master`: the legacy plural tables (`sessions`/`messages`; read and write), OpenCode 1.x (`session`/`message`/`part`; read only) and OpenCode 2.x (`session_v2` + the `session_message` entry log; read only). A DB migrated from 1.x to 2.x still carries the stale 1.x tables, so 2.x is probed first. For 2.x, `user`/`assistant`/`system` entries map directly (assistant `tool` parts become tool calls plus results carrying the completed output or the error), `shell` and `synthetic` entries become tool-side turns, completed `compaction` checkpoints become system context, and `model-switched`/`agent-switched`/`location-switched` bookkeeping is skipped. The 1.x and 2.x tables are projections of OpenCode's own event log, so casr never writes into them; convert *out* of OpenCode, or point `OPENCODE_DB_PATH` at a separate legacy-layout DB.
 
 ## Installation
 
@@ -286,6 +287,8 @@ export CLINE_HOME="$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev"
 export AIDER_HOME="$HOME/.aider"
 export AMP_HOME="$HOME/.local/share/amp"
 export OPENCODE_HOME="$HOME/.opencode"
+# OpenCode 1.x/2.x keep their DB under XDG data (auto-discovered); pin one explicitly with:
+export OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode.db"
 
 # Logging verbosity (alternative to --verbose / --trace)
 export RUST_LOG="casr=debug"
