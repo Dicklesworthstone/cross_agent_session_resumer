@@ -6,6 +6,33 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ---
 
+## [v0.4.1] -- 2026-09-07
+
+Patch release. Tag + GitHub Release (linux x86_64/aarch64 musl and macOS x86_64/arm64 binaries).
+
+### Added
+
+- **OpenCode 1.x sessions are readable**: the singular event-sourced schema (`session`/`message`/`part`) that OpenCode 1.x ships is detected from `sqlite_master` and read alongside the legacy plural layout. Flat `part.data` blobs become canonical content, tool calls and tool results (`text`, `reasoning` as a fallback, `tool` parts once `state.status` is `completed`/`error`, `file` parts as a visible marker); bookkeeping parts (`step-start`, `step-finish`, `snapshot`, `patch`, `agent`) are dropped ([`6125e7e`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/6125e7e), [`4722220`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/4722220), [`779896f`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/779896f)). Closes [#26](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/26).
+- **OpenCode 2.x (beta) sessions are readable**: `session_v2` plus the per-entry `session_message` log (`ORDER BY seq`) is detected *before* the 1.x and legacy layouts, so a DB migrated from 1.x -- which still carries the dead 1.x tables -- lists only its live sessions. `user`/`assistant`/`system` entries map directly (assistant `tool` parts become a tool call plus a result carrying the completed output or the `error {type, message}`; streaming/pending calls carry no result), `synthetic`/`skill`/`shell` entries become tool-side turns, completed `compaction` checkpoints become system context, and `model-switched`/`agent-switched`/`location-switched` bookkeeping is skipped. Session model, timestamps, tokens, cost and parent/fork/project/workspace ids are kept as metadata; untitled sessions take their first user turn as the title ([`2392b39`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/2392b39)). Closes [#30](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/30).
+- **XDG discovery for OpenCode**: `$XDG_DATA_HOME/opencode/opencode.db` is probed (falling back to `~/.local/share/opencode/opencode.db`), so redirected data homes are found; `OPENCODE_DB_PATH` still pins a DB explicitly ([`2079b02`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/2079b02)).
+
+### Fixed
+
+- **OpenCode schema mismatches are loud**: an `opencode.db` whose layout casr does not recognise now errors (`read_session`) or warns (`list_sessions`/`owns_session`) with the missing table(s), the tables actually present, and the closest known schema, instead of silently reporting zero sessions ([`2079b02`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/2079b02)). From [#26](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/26).
+- **Writes into live OpenCode 1.x/2.x databases are refused**: those tables are projections of OpenCode's own event log, so `write_session` bails with the mechanism explained and leaves the file byte-identical; the schema probe uses a read-only connection so the refusal never opens OpenCode's WAL-mode DB read-write. The provider table in the README now says OpenCode write is legacy-DB only ([`779896f`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/779896f), [`2392b39`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/2392b39)).
+- **`install.sh` fails loudly on a missing prebuilt asset**: a mapped target whose release asset 404s now errors with a pointer at the issue tracker instead of silently falling back to a full source build (the v0.4.0-on-macOS failure mode); unmapped platforms report `NO_PREBUILT_REASON` and require an explicit `--from-source` ([`2982ac8`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/2982ac8)). From [#25](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/25).
+- **2.x `owns_session` test canonicalizes its expectation**, so the suite passes on macOS where tempdirs resolve to `/private/var/...`.
+
+### Changed
+
+- **AGENTS.md** separates read-only inspection from mutations (git status/diff never need permission; `git stash` sits with the mutations), scopes the session wrap-up rules to sessions that changed something, and clarifies the main-to-master mirror and shared-checkout ownership ([`e21c74c`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/e21c74c)). Closes [#28](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/28).
+
+### Build
+
+- Toolchain pinned to `nightly-2026-08-31` ([`6eecd86`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/6eecd86)).
+
+---
+
 ## [v0.4.0] -- 2026-08-23
 
 Minor release. Tag + GitHub Release (linux x86_64 musl binary) + crates.io.

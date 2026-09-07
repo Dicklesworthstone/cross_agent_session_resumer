@@ -4119,9 +4119,13 @@ INSERT INTO project (id, worktree, name) VALUES ('prj_2', '/work', 'work');
             assert!(session.started_at.is_some(), "{id} must carry a start time");
         }
 
+        // Discovery spells the DB path the way `current_dir()` resolves it
+        // (macOS reports `/var/...` tempdirs as `/private/var/...`), so the
+        // expectation has to be built from the canonical path too.
+        let canonical_db = db_path.canonicalize().expect("db path canonicalizes");
         assert_eq!(
             OpenCode.owns_session(V2_SESSION_ID),
-            Some(OpenCode::virtual_session_path(&db_path, V2_SESSION_ID))
+            Some(OpenCode::virtual_session_path(&canonical_db, V2_SESSION_ID))
         );
     }
 
