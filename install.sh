@@ -597,8 +597,8 @@ resolve_version() {
   local tag
   if tag=$(curl -fsSL --connect-timeout 5 "${PROXY_ARGS[@]}" \
     -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null \
-    | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
-    if [ -n "$tag" ]; then
+    | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/'); then
+    if [ -n "$tag" ] && [[ "$tag" =~ ^v?[0-9] ]]; then
       VERSION="$tag"
       info "Resolved latest version: $VERSION"
       return 0
