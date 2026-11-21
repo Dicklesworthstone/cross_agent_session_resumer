@@ -226,7 +226,7 @@ impl Provider for ClawdBot {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let session_id = if session.session_id.is_empty() {
-            format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
+            format!("casr-{}", jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S"))
         } else {
             session.session_id.clone()
         };
@@ -261,11 +261,11 @@ impl Provider for ClawdBot {
                 serde_json::Value::String(msg.content.clone()),
             );
             if let Some(ts) = msg.timestamp {
-                let dt =
-                    chrono::DateTime::from_timestamp_millis(ts).unwrap_or_else(chrono::Utc::now);
+                let dt = jiff::Timestamp::from_millisecond(ts)
+                    .unwrap_or_else(|_| jiff::Timestamp::now());
                 obj.insert(
                     "timestamp".into(),
-                    serde_json::Value::String(dt.to_rfc3339()),
+                    serde_json::Value::String(dt.to_string()),
                 );
             }
 
@@ -496,11 +496,11 @@ mod tests {
                 serde_json::Value::String(msg.content.clone()),
             );
             if let Some(ts) = msg.timestamp {
-                let dt =
-                    chrono::DateTime::from_timestamp_millis(ts).unwrap_or_else(chrono::Utc::now);
+                let dt = jiff::Timestamp::from_millisecond(ts)
+                    .unwrap_or_else(|_| jiff::Timestamp::now());
                 obj.insert(
                     "timestamp".into(),
-                    serde_json::Value::String(dt.to_rfc3339()),
+                    serde_json::Value::String(dt.to_string()),
                 );
             }
             lines.push(serde_json::to_string(&serde_json::Value::Object(obj)).unwrap());

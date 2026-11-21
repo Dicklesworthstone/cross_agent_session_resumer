@@ -866,7 +866,7 @@ impl Provider for Grok {
         // ------------------------------------------------------------------
         // updates.jsonl — one ACP session-update event per line.
         // ------------------------------------------------------------------
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = jiff::Timestamp::now().as_millisecond();
         let fallback_ms = session.started_at.unwrap_or(now_ms);
         let mut lines: Vec<String> = Vec::new();
         let mut event_seq: u64 = 0;
@@ -995,9 +995,9 @@ impl Provider for Grok {
         // summary.json — the index entry (shape captured from real sessions).
         // ------------------------------------------------------------------
         let iso = |ms: i64| -> String {
-            chrono::DateTime::from_timestamp_millis(ms)
-                .unwrap_or_else(chrono::Utc::now)
-                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            let ts =
+                jiff::Timestamp::from_millisecond(ms).unwrap_or_else(|_| jiff::Timestamp::now());
+            format!("{ts:.9}")
         };
         let created_ms = session.started_at.unwrap_or(now_ms);
         let updated_ms = session.ended_at.unwrap_or(created_ms);

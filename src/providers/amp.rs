@@ -672,7 +672,7 @@ impl Provider for Amp {
 
         let created = session
             .started_at
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+            .unwrap_or_else(|| jiff::Timestamp::now().as_millisecond());
 
         let thread_json = Self::build_thread_json(session, &thread_id, created);
         let bytes = serde_json::to_vec_pretty(&thread_json)?;

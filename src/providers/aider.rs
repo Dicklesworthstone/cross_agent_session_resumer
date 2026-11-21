@@ -483,9 +483,9 @@ impl Provider for Aider {
         session: &CanonicalSession,
         _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let target_session_id = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-        let now = chrono::Utc::now();
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = jiff::Timestamp::now();
+        let target_session_id = now.strftime("%Y-%m-%dT%H-%M-%S").to_string();
+        let now_str = now.strftime("%Y-%m-%d %H:%M:%S").to_string();
 
         // Determine target path.
         let target_dir = if let Some(home) = Self::home_dir() {
@@ -631,9 +631,10 @@ fn parse_aider_timestamp(ts: &str) -> Option<i64> {
     if ts.is_empty() {
         return None;
     }
-    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", ts)
         .ok()
-        .map(|dt| dt.and_utc().timestamp_millis())
+        .and_then(|dt| jiff::tz::Offset::UTC.to_timestamp(dt).ok())
+        .map(|ts| ts.as_millisecond())
 }
 
 /// Extract model name from an Aider tool output line.

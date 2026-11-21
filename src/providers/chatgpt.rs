@@ -435,7 +435,7 @@ impl Provider for ChatGpt {
         );
 
         // Build the ChatGPT mapping structure.
-        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let now_secs = jiff::Timestamp::now().as_second() as f64;
         let create_time = session
             .started_at
             .map(|ms| ms as f64 / 1000.0)
@@ -1155,7 +1155,7 @@ mod tests {
         // Set CHATGPT_HOME to temp dir so writer has a target.
         // Since we can't use set_var (unsafe), we test the JSON structure
         // by serializing what the writer would produce.
-        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let now_secs = jiff::Timestamp::now().as_second() as f64;
         let mut mapping = serde_json::Map::new();
         let mut prev_node_id: Option<String> = None;
 

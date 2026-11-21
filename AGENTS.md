@@ -87,7 +87,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `clap` + `clap_complete` | CLI argument parsing and shell completions (`casr resume <target> <session-id>`) |
 | `serde` + `serde_json` | Canonical session model + provider format parsing/writing |
 | `anyhow` + `thiserror` | Internal propagation + actionable user-facing errors |
-| `chrono` | Timestamp normalization (ISO-8601, epoch seconds/millis) |
+| `jiff` | Timestamp normalization and formatting (ISO-8601/RFC 3339, epoch seconds/millis, local time display) |
 | `walkdir` + `dirs` + `which` | Provider detection and session discovery |
 | `glob` | Pattern matching for file paths |
 | `rusqlite` | SQLite session storage (bundled) |
@@ -96,15 +96,15 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `colored` | Terminal colors with TTY detection |
 | `urlencoding` | URL encoding for provider path handling |
 | `tracing` + `tracing-subscriber` | Structured debug/trace logging |
-| `vergen-gix` | Build metadata embedding (build.rs) |
+| `vergen-gitcl` | Build metadata embedding (build.rs) |
 
 ### Release Profile
 
-The release build optimizes for binary size:
+The release build optimizes for runtime performance:
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary for distribution)
+opt-level = 3       # Optimize for runtime speed
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
@@ -434,7 +434,7 @@ CLI Input
 ```
 cross_agent_session_resumer/
 ├── Cargo.toml                        # Single crate (not a workspace)
-├── build.rs                          # vergen-gix build metadata
+├── build.rs                          # vergen-gitcl build metadata
 ├── src/
 │   ├── main.rs                       # Clap CLI and output rendering
 │   ├── lib.rs                        # Public library entry points

@@ -330,7 +330,7 @@ impl Provider for Kiro {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let dir = Self::sessions_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine Kiro sessions directory"))?;
@@ -347,11 +347,11 @@ impl Provider for Kiro {
         // --- Metadata (.json) ---------------------------------------------
         let created_at = session
             .started_at
-            .and_then(chrono::DateTime::from_timestamp_millis)
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
             .unwrap_or(now);
         let updated_at = session
             .ended_at
-            .and_then(chrono::DateTime::from_timestamp_millis)
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
             .unwrap_or(now);
 
         let mut meta = serde_json::Map::new();
@@ -669,8 +669,8 @@ fn model_name_from_info(info: &serde_json::Value) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Render a UTC timestamp in Kiro's observed `...Z` micros format.
-fn rfc3339_micros(dt: chrono::DateTime<chrono::Utc>) -> String {
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+fn rfc3339_micros(dt: jiff::Timestamp) -> String {
+    format!("{dt:.6}")
 }
 
 /// Build a minimal but well-formed `session_state` when none was carried.

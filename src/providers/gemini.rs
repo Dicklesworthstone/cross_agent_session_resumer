@@ -42,17 +42,21 @@ pub struct Gemini;
 /// Example: `/data/projects/foo` → `sha256(b"/data/projects/foo")` (64 hex chars)
 pub fn project_hash(workspace: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(workspace.to_string_lossy().as_bytes());
-    format!("{:x}", hasher.finalize())
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Generate a Gemini session filename from a session ID and timestamp.
 ///
 /// Convention: `session-YYYY-MM-DDThh-mm-<uuid-prefix>.json`
 /// where `<uuid-prefix>` is the first 8 chars of the session UUID.
-pub fn session_filename(session_id: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
-    let ts = now.format("%Y-%m-%dT%H-%M").to_string();
+pub fn session_filename(session_id: &str, now: &jiff::Timestamp) -> String {
+    let ts = now.strftime("%Y-%m-%dT%H-%M").to_string();
     let prefix: String = session_id.chars().take(8).collect();
     format!("session-{ts}-{prefix}.json")
 }
@@ -346,7 +350,7 @@ impl Provider for Gemini {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         // Determine target path.
         let tmp_dir = Self::tmp_dir()
@@ -375,17 +379,17 @@ impl Provider for Gemini {
         );
 
         // Build the Gemini JSON structure.
-        let start_time = session
+        let start_ts = session
             .started_at
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .unwrap_or(now)
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+            .unwrap_or(now);
+        let start_time = format!("{start_ts:.3}");
 
-        let last_updated = session
+        let updated_ts = session
             .ended_at
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .unwrap_or(now)
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+            .unwrap_or(now);
+        let last_updated = format!("{updated_ts:.3}");
 
         let mut json_messages: Vec<serde_json::Value> = Vec::with_capacity(session.messages.len());
 
@@ -394,8 +398,8 @@ impl Provider for Gemini {
 
             let ts = msg
                 .timestamp
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| format!("{dt:.3}"));
 
             let mut entry = serde_json::json!({
                 "type": msg_type,
@@ -859,7 +863,6 @@ mod tests {
         Gemini, gemini_message_content, gemini_message_type, merge_gemini_extra_fields,
         normalize_workspace_candidate, project_hash, session_filename,
     };
-    use chrono::{TimeZone, Utc};
     use serde_json::json;
     use std::path::Path;
 
@@ -892,9 +895,8 @@ mod tests {
 
     #[test]
     fn session_filename_uses_timestamp_and_uuid_prefix() {
-        let now = Utc
-            .with_ymd_and_hms(2026, 1, 10, 2, 6, 44)
-            .single()
+        let now = "2026-01-10T02:06:44Z"
+            .parse::<jiff::Timestamp>()
             .expect("valid timestamp");
         let filename = session_filename("8c1890a5-eb39-4c5c-acff-93790d35dd3f", &now);
         assert_eq!(filename, "session-2026-01-10T02-06-8c1890a5.json");

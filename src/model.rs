@@ -239,22 +239,16 @@ pub fn parse_timestamp(value: &serde_json::Value) -> Option<i64> {
                     f as i64
                 });
             }
-            // Try RFC 3339 / ISO-8601 with timezone.
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                return Some(dt.timestamp_millis());
+            // Try RFC 3339 / ISO-8601 with timezone (Z or ±HH:MM).
+            if let Ok(ts) = s.parse::<jiff::Timestamp>() {
+                return Some(ts.as_millisecond());
             }
-            // Try common ISO-8601 variants.
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
-                return Some(dt.and_utc().timestamp_millis());
-            }
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ") {
-                return Some(dt.and_utc().timestamp_millis());
-            }
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
-                return Some(dt.and_utc().timestamp_millis());
-            }
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-                return Some(dt.and_utc().timestamp_millis());
+            // Try naive ISO-8601 variants without timezone (assume UTC).
+            if (s.contains('T') || s.contains('t'))
+                && let Ok(dt) = s.parse::<jiff::civil::DateTime>()
+                && let Ok(ts) = jiff::tz::Offset::UTC.to_timestamp(dt)
+            {
+                return Some(ts.as_millisecond());
             }
             None
         }

@@ -41,13 +41,9 @@ pub struct Codex;
 /// Convention: `~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<session-id>.jsonl`
 ///
 /// The session ID is a ULID (timestamp-prefixed UUID).
-pub fn rollout_path(
-    sessions_dir: &Path,
-    session_id: &str,
-    now: &chrono::DateTime<chrono::Utc>,
-) -> PathBuf {
-    let date_dir = now.format("%Y/%m/%d").to_string();
-    let ts_part = now.format("%Y-%m-%dT%H-%M-%S").to_string();
+pub fn rollout_path(sessions_dir: &Path, session_id: &str, now: &jiff::Timestamp) -> PathBuf {
+    let date_dir = now.strftime("%Y/%m/%d").to_string();
+    let ts_part = now.strftime("%Y-%m-%dT%H-%M-%S").to_string();
     let filename = format!("rollout-{ts_part}-{session_id}.jsonl");
     sessions_dir.join(date_dir).join(filename)
 }
@@ -227,15 +223,22 @@ impl Provider for Codex {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
 
-        // Detect format: if first non-whitespace char is '{' and the file has
-        // multiple JSON lines, it's JSONL. If the top-level parse yields a
-        // "session" or "items" key, it's legacy JSON.
+        // Detect format: try parsing the first line first (fast O(1) path for
+        // JSONL and compact legacy JSON). If the first line is not a complete
+        // JSON value (e.g., pretty-printed multi-line legacy JSON starting with
+        // `{`), try parsing the full document as a single JSON object.
         let trimmed = content.trim_start();
-        if let Some(first_line) = trimmed.lines().next()
-            && let Ok(obj) = serde_json::from_str::<serde_json::Value>(first_line)
-            && (obj.get("session").is_some() || obj.get("items").is_some())
-        {
-            return self.read_legacy_json(path, &content);
+        if let Some(first_line) = trimmed.lines().next() {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(first_line) {
+                if obj.get("session").is_some() || obj.get("items").is_some() {
+                    return self.read_legacy_json_value(path, obj);
+                }
+            } else if trimmed.starts_with('{')
+                && let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && (obj.get("session").is_some() || obj.get("items").is_some())
+            {
+                return self.read_legacy_json_value(path, obj);
+            }
         }
 
         self.read_jsonl(path, &content)
@@ -247,7 +250,7 @@ impl Provider for Codex {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let sessions_dir = Self::sessions_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine Codex sessions directory"))?;
@@ -271,7 +274,7 @@ impl Provider for Codex {
         // Current Codex readers deserialize each rollout line's top-level
         // `timestamp` as an RFC3339 *string* (not a numeric epoch). Emit the
         // string form both at the envelope level and inside the payload.
-        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let now_iso = format!("{now:.3}");
         lines.push(serde_json::to_string(&serde_json::json!({
             "type": "session_meta",
             "timestamp": now_iso,
@@ -292,11 +295,11 @@ impl Provider for Codex {
 
         // 2. Messages. Each envelope carries an RFC3339 string timestamp.
         for msg in &session.messages {
-            let msg_iso = msg
+            let msg_ts = msg
                 .timestamp
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .unwrap_or(now)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .unwrap_or(now);
+            let msg_iso = format!("{msg_ts:.3}");
 
             for event in codex_events_for_message(msg, &msg_iso) {
                 lines.push(serde_json::to_string(&event)?);
@@ -423,7 +426,7 @@ impl Codex {
         title: &str,
         first_user_message: &str,
         preview: &str,
-        now: &chrono::DateTime<chrono::Utc>,
+        now: &jiff::Timestamp,
     ) -> Vec<String> {
         let Some(db_path) = Self::latest_state_db() else {
             debug!("no Codex state_*.sqlite found; skipping thread registration");
@@ -613,7 +616,7 @@ fn register_thread_in_db(
     title: &str,
     first_user_message: &str,
     preview: &str,
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &jiff::Timestamp,
 ) -> anyhow::Result<()> {
     let mut conn = Connection::open_with_flags(
         db_path,
@@ -638,8 +641,8 @@ fn register_thread_in_db(
             .unwrap_or_else(|_| rollout_path.to_path_buf())
     };
     let abs_str = abs.to_string_lossy().to_string();
-    let created = now.timestamp();
-    let created_ms = now.timestamp_millis();
+    let created = now.as_second();
+    let created_ms = now.as_millisecond();
 
     // Desired (column, value) pairs. Filtered to columns that actually exist so
     // the write is resilient across Codex schema versions.
@@ -1216,10 +1219,19 @@ impl Codex {
     }
 
     /// Parse legacy single-JSON format: `{ "session": {…}, "items": […] }`.
+    #[cfg(test)]
     fn read_legacy_json(&self, path: &Path, content: &str) -> anyhow::Result<CanonicalSession> {
         let root: serde_json::Value = serde_json::from_str(content)
             .with_context(|| format!("failed to parse legacy JSON {}", path.display()))?;
+        self.read_legacy_json_value(path, root)
+    }
 
+    /// Parse an already-decoded legacy single-JSON value without re-parsing.
+    fn read_legacy_json_value(
+        &self,
+        path: &Path,
+        root: serde_json::Value,
+    ) -> anyhow::Result<CanonicalSession> {
         let session_obj = root.get("session");
         let session_id = session_obj
             .and_then(|s| s.get("id"))
@@ -1553,7 +1565,6 @@ fn session_meta_id(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{Codex, codex_events_for_message, rollout_path};
-    use chrono::{TimeZone, Utc};
     use serde_json::json;
     use std::path::Path;
 
@@ -1562,9 +1573,8 @@ mod tests {
 
     #[test]
     fn rollout_path_includes_date_hierarchy_and_uuid_suffix() {
-        let now = Utc
-            .with_ymd_and_hms(2026, 2, 9, 6, 7, 8)
-            .single()
+        let now = "2026-02-09T06:07:08Z"
+            .parse::<jiff::Timestamp>()
             .expect("valid timestamp");
         let path = rollout_path(
             Path::new("/tmp/codex/sessions"),
@@ -2079,5 +2089,27 @@ not json
         );
         assert!(joined.contains("KEPT SUMMARY TASK"), "got: {joined}");
         assert!(joined.contains("POST answer"), "got: {joined}");
+    }
+
+    #[test]
+    fn reader_reads_pretty_printed_legacy_json() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("rollout-legacy.json");
+        let pretty = serde_json::to_string_pretty(&json!({
+            "session": { "id": "codex-pretty-legacy-001", "cwd": "/tmp/ws" },
+            "items": [
+                { "role": "user", "content": "Hello from pretty JSON", "timestamp": 1_736_900_000 },
+                { "role": "assistant", "content": "Hi there", "timestamp": 1_736_900_010 }
+            ]
+        }))
+        .expect("serialize");
+        std::fs::write(&path, pretty).expect("write");
+
+        let session = Codex.read_session(&path).expect("read pretty legacy json");
+        assert_eq!(session.session_id, "codex-pretty-legacy-001");
+        assert_eq!(session.workspace.as_deref(), Some(Path::new("/tmp/ws")));
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "Hello from pretty JSON");
+        assert_eq!(session.messages[1].content, "Hi there");
     }
 }

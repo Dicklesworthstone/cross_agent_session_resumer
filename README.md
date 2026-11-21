@@ -121,8 +121,8 @@ What this installer does for you:
 | Capability | Behavior |
 |---|---|
 | Platform targeting | Detects Linux/macOS + x86_64/aarch64 and picks the right artifact |
-| Supply-chain checks | Verifies SHA256 and Sigstore/cosign when available |
-| Download fallback chain | Versioned release -> latest release naming variants -> source build |
+| Supply-chain checks | Enforces SHA256 verification (fail-closed unless `--no-verify`) and Sigstore/cosign when available |
+| Download fallback chain | Versioned release -> same-tag legacy naming (never substitutes `latest` or silently builds from source; use `--from-source`) |
 | Airgap install | `--offline <tarball>` installs from local artifacts |
 | Proxy-aware networking | Uses `HTTPS_PROXY` / `HTTP_PROXY` automatically |
 | Shell UX | Installs completions for bash/zsh/fish |
@@ -160,11 +160,15 @@ cargo build --release
 ./target/release/casr --help
 ```
 
-### Alternative: Cargo Local Install
+### Alternative: Cargo Install (crates.io or Local)
 
 ```bash
-cargo install --path .
+# From crates.io (note the package name is cross_agent_session_resumer; the CLI binary is casr)
+cargo install cross_agent_session_resumer --locked
 casr --help
+
+# Or from a local checkout
+cargo install --path .
 ```
 
 ### Alternative: Development Mode

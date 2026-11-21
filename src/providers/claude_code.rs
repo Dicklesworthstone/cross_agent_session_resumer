@@ -441,8 +441,8 @@ impl Provider for ClaudeCode {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
-        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let now = jiff::Timestamp::now();
+        let now_iso = format!("{now:.3}");
 
         // Determine the project directory key from workspace. When the session
         // recorded none, fall back to the invoking cwd (never /tmp): Claude Code
@@ -470,11 +470,8 @@ impl Provider for ClaudeCode {
             let entry_uuid = uuid::Uuid::new_v4().to_string();
             let msg_ts = msg
                 .timestamp
-                .map(|ts| {
-                    chrono::DateTime::from_timestamp_millis(ts)
-                        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-                        .unwrap_or_else(|| now_iso.clone())
-                })
+                .and_then(|ts| jiff::Timestamp::from_millisecond(ts).ok())
+                .map(|dt| format!("{dt:.3}"))
                 .unwrap_or_else(|| now_iso.clone());
 
             let entry_type = claude_entry_type(&msg.role);

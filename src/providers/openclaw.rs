@@ -353,7 +353,7 @@ impl Provider for OpenClaw {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let session_id = if session.session_id.is_empty() {
-            format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
+            format!("casr-{}", jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S"))
         } else {
             session.session_id.clone()
         };
@@ -380,9 +380,9 @@ impl Provider for OpenClaw {
             "type": "session",
             "id": session_id,
             "timestamp": session.started_at
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string()),
             "cwd": workspace,
             "version": "0.1.0",
         });
@@ -438,9 +438,9 @@ impl Provider for OpenClaw {
 
             let ts_str = msg
                 .timestamp
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string());
 
             let entry = serde_json::json!({
                 "type": "message",
@@ -701,9 +701,9 @@ mod tests {
             "type": "session",
             "id": session.session_id,
             "timestamp": session.started_at
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string()),
             "cwd": workspace,
         });
         lines.push(serde_json::to_string(&header).unwrap());
@@ -718,9 +718,9 @@ mod tests {
             };
             let ts_str = msg
                 .timestamp
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string());
 
             let content: serde_json::Value = if msg.tool_calls.is_empty() {
                 serde_json::Value::String(msg.content.clone())

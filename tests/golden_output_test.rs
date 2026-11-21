@@ -264,7 +264,7 @@ fn is_uuid_v4(s: &str) -> bool {
 
 /// Check if a string is a valid RFC-3339 timestamp.
 fn is_rfc3339(s: &str) -> bool {
-    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+    s.parse::<jiff::Timestamp>().is_ok()
 }
 
 /// Check if a float is a plausible epoch timestamp (seconds since 1970).
@@ -685,7 +685,7 @@ mod codex_golden {
             );
         } else if let Some(iso) = ts.as_str() {
             assert!(
-                chrono::DateTime::parse_from_rfc3339(iso).is_ok(),
+                iso.parse::<jiff::Timestamp>().is_ok(),
                 "Codex session_meta timestamp must be RFC3339-parseable: {iso}"
             );
         } else {
@@ -750,7 +750,7 @@ mod codex_golden {
                 );
             } else if let Some(iso) = ts.as_str() {
                 assert!(
-                    chrono::DateTime::parse_from_rfc3339(iso).is_ok(),
+                    iso.parse::<jiff::Timestamp>().is_ok(),
                     "Codex entry {i} timestamp must be RFC3339-parseable: {iso}"
                 );
             } else {
@@ -1046,9 +1046,13 @@ mod gemini_golden {
         let workspace = session.workspace.as_ref().unwrap();
         let expected_hash = {
             use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(workspace.to_string_lossy().as_bytes());
-            format!("{:x}", hasher.finalize())
+            use std::fmt::Write as _;
+            let digest = sha2::Sha256::digest(workspace.to_string_lossy().as_bytes());
+            let mut hex = String::with_capacity(64);
+            for b in digest {
+                let _ = write!(&mut hex, "{b:02x}");
+            }
+            hex
         };
 
         let (_, content) = write_gemini_session(&session);

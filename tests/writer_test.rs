@@ -369,7 +369,7 @@ fn writer_cc_timestamps_are_rfc3339() {
                 panic!("CC line {i}: timestamp should be a string");
             }
         };
-        if let Err(e) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+        if let Err(e) = ts_str.parse::<jiff::Timestamp>() {
             panic!("CC line {i}: timestamp '{ts_str}' not valid RFC3339: {e}");
         }
     }
@@ -829,7 +829,7 @@ fn writer_codex_top_level_timestamps_are_strings() {
         let s = ts
             .as_str()
             .unwrap_or_else(|| panic!("Codex line {i}: timestamp should be a string, got: {ts}"));
-        chrono::DateTime::parse_from_rfc3339(s)
+        s.parse::<jiff::Timestamp>()
             .unwrap_or_else(|e| panic!("Codex line {i}: timestamp not RFC3339 ({e}): {s}"));
     }
 }
@@ -1074,7 +1074,7 @@ fn writer_gemini_timestamps_are_rfc3339() {
                 panic!("Gemini: {field} should be string");
             }
         };
-        if let Err(e) = chrono::DateTime::parse_from_rfc3339(ts) {
+        if let Err(e) = ts.parse::<jiff::Timestamp>() {
             panic!("Gemini: {field} '{ts}' not valid RFC3339: {e}");
         }
     }
@@ -1082,7 +1082,7 @@ fn writer_gemini_timestamps_are_rfc3339() {
     // Per-message timestamps.
     for (i, msg) in root["messages"].as_array().unwrap().iter().enumerate() {
         if let Some(ts) = msg["timestamp"].as_str()
-            && let Err(e) = chrono::DateTime::parse_from_rfc3339(ts)
+            && let Err(e) = ts.parse::<jiff::Timestamp>()
         {
             panic!("Gemini msg {i}: timestamp '{ts}' not valid RFC3339: {e}");
         }
@@ -1628,7 +1628,7 @@ fn writer_clawdbot_timestamps_are_rfc3339() {
     for (i, line) in content.lines().enumerate() {
         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
         if let Some(ts_str) = entry["timestamp"].as_str()
-            && let Err(e) = chrono::DateTime::parse_from_rfc3339(ts_str)
+            && let Err(e) = ts_str.parse::<jiff::Timestamp>()
         {
             panic!("ClawdBot line {i}: timestamp '{ts_str}' not valid RFC3339: {e}");
         }

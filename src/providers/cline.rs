@@ -208,7 +208,7 @@ impl Cline {
 
     fn generate_task_id(storage_root: &Path) -> String {
         let tasks_root = Self::tasks_root(storage_root);
-        let mut candidate: i64 = chrono::Utc::now().timestamp_millis();
+        let mut candidate: i64 = jiff::Timestamp::now().as_millisecond();
         loop {
             let id = candidate.to_string();
             if !tasks_root.join(&id).exists() {
@@ -275,7 +275,7 @@ impl Cline {
     }
 
     fn build_ui_messages(session: &CanonicalSession) -> Vec<serde_json::Value> {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = jiff::Timestamp::now().as_millisecond();
         let mut cursor_ts = session.started_at.unwrap_or(now);
 
         // Cline's UI messages are not a simple chat transcript; we emit a minimal, plausible subset:
@@ -348,7 +348,7 @@ impl Cline {
 
         let ts = session
             .started_at
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+            .unwrap_or_else(|| jiff::Timestamp::now().as_millisecond());
 
         let mut obj = serde_json::Map::new();
         obj.insert("id".into(), serde_json::Value::String(task_id.to_string()));

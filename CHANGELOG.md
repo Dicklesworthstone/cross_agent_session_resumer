@@ -6,6 +6,35 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ---
 
+## [v0.5.0] -- 2026-11-21
+
+Minor release. Tag + GitHub Release (macOS arm64/x86_64, Linux x86_64/aarch64 musl, and Windows x86_64 binaries) + crates.io (`cross_agent_session_resumer` 0.5.0).
+
+### Security & Dependencies
+
+- **Eliminated all `cargo audit` vulnerabilities and advisories (0 vulnerabilities, 0 warnings across 185 locked crates, down from 2 vulnerabilities and 15 warnings across 277 crates)**:
+  - Upgraded `rusqlite` `0.33` -> `0.43` (`libsqlite3-sys` `0.31.0` -> `0.40.0`), resolving `RUSTSEC-2026-0459` / CVE-2026-119375.
+  - Upgraded `rayon` `1.11.0` -> `1.12.0` (`crossbeam-epoch` `0.9.18` -> `0.9.21`), resolving `RUSTSEC-2026-0204`.
+  - Upgraded `anyhow` `1.0.101` -> `1.0.104`, resolving `RUSTSEC-2026-0190`.
+  - Upgraded `rich_rust` `0.2.1` -> `0.2.3` (`lru` `0.16.3` -> `0.18.5`, `rustix` `1.1.3` -> `1.1.6`), resolving `RUSTSEC-2026-0253` and `RUSTSEC-2026-0486`.
+  - Replaced build dependency `vergen-gix` `9.1.0` with `vergen-gitcl` `10.0.4` (using `.default_on_error()` plus explicit `cargo:rerun-if-env-changed=VERGEN_GIT_SHA`), removing ~90 build-only `gix-*` crates along with `faster-hex`, `memmap2`, and `heapless` build-script advisories (`RUSTSEC-2026-0306`, `RUSTSEC-2026-0186`, `RUSTSEC-2026-0574`..`0582`) while preserving `casr --version` build metadata both in git checkouts, staged source builds with `VERGEN_GIT_SHA`, and crates.io installs without `.git`.
+  - Migrated timestamp parsing and formatting from unmaintained `chrono` (`RUSTSEC-2026-0543`) to `jiff` `1.0` across all providers, core model, CLI display, and tests.
+  - Upgraded `which` `7` -> `8`, `dirs` `6` -> `7`, `sha2` `0.10` -> `0.11`, `clap` `4.5` -> `4.6`, `clap_complete` `4.5` -> `4.6`, `uuid` `1.20` -> `1.29`, `serde`/`serde_json`/`thiserror`/`tempfile`/`assert_cmd`/`predicates` to latest stable releases.
+
+### Fixed
+
+- **Hardened `install.sh` checksum verification to fail closed** ([#33](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/33)): missing `sha256sum`/`shasum`, failed `.sha256` sidecar fetches, empty checksum files, and malformed digests now abort before extraction/install while leaving any existing binary byte-identical (preserving `--no-verify` as an explicit escape hatch).
+- **Hardened `install.sh` version pinning and download fallback** ([#32](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/32)): removed mutable `/releases/latest/download/` fallbacks and the silent `v0.1.0` fallback when latest-release resolution fails; explicit `--artifact-url` failures no longer fall back; legacy simple-name fallback stays pinned to the selected `${VERSION}` tag and updates `URL`/`TAR` so verification binds to the exact downloaded artifact.
+- **Codex legacy JSON reader handles pretty-printed multi-line `.json` files**: `Codex::read_session` previously inspected only the first line for `"session"`/`"items"`, causing pretty-printed legacy `.json` sessions to fall through to the JSONL reader and parse zero messages; it now falls back to parsing the full JSON document when the first line is not a complete JSON object, with a regression unit test.
+- **Installer latest-tag parsing handles minified GitHub API JSON** (`fac8916`).
+
+### Performance & Packaging
+
+- **Switched `[profile.release]` from `opt-level = "z"` to `opt-level = 3`** (keeping `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`), delivering faster session listing and cross-provider conversion for both prebuilt binaries and `cargo install cross_agent_session_resumer` consumers ([#34](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/34)).
+- **Crates.io catch-up & full release provenance**: published `cross_agent_session_resumer` `0.5.0` to crates.io alongside signed multi-platform GitHub Release binaries and `SHA256SUMS` ([#34](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/34)).
+
+---
+
 ## [v0.4.1] -- 2026-09-07
 
 Patch release. Tag + GitHub Release (linux x86_64/aarch64 musl and macOS x86_64/arm64 binaries).

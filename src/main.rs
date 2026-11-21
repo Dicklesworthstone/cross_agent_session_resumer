@@ -9,7 +9,6 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use chrono::{Local, Utc};
 use clap::Parser;
 use colored::Colorize;
 use rayon::prelude::*;
@@ -169,8 +168,9 @@ enum Command {
 
 /// Build the long version string with embedded build metadata.
 ///
-/// vergen-gix always emits these env vars (uses placeholders when values are
-/// unavailable), so `env!()` is safe here.
+/// vergen-gitcl always emits these env vars (uses placeholders when values are
+/// unavailable, or honors explicit `VERGEN_GIT_SHA` overrides), so `env!()` is
+/// safe here.
 fn long_version() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
@@ -558,10 +558,10 @@ fn cmd_list(
 
         fn started_at_display(&self) -> String {
             self.started_at
-                .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
-                .map(|dt| {
-                    dt.with_timezone(&Local)
-                        .format("%Y-%m-%d %H:%M")
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|ts| {
+                    ts.to_zoned_datetime(jiff::tz::TimeZone::system())
+                        .strftime("%Y-%m-%d %H:%M")
                         .to_string()
                 })
                 .unwrap_or_else(|| "-".to_string())
@@ -1427,7 +1427,7 @@ fn cmd_list(
             );
         }
 
-        let now_millis = Utc::now().timestamp_millis();
+        let now_millis = jiff::Timestamp::now().as_millisecond();
 
         for (provider_slug, provider_sessions) in &sessions_by_provider {
             if provider_sessions.is_empty() {

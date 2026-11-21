@@ -379,18 +379,22 @@ impl Provider for PiAgent {
         // Pi-Agent filenames must contain an underscore to be discoverable
         // by `owns_session`. Convention: `<timestamp>_<uuid>.jsonl`.
         let session_id = if session.session_id.is_empty() {
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             format!(
                 "{}_casr-{}",
-                now.format("%Y-%m-%dT%H-%M-%S"),
+                now.strftime("%Y-%m-%dT%H-%M-%S"),
                 uuid::Uuid::new_v4()
             )
         } else if session.session_id.contains('_') {
             session.session_id.clone()
         } else {
             // Incoming ID lacks underscore — prefix with timestamp.
-            let now = chrono::Utc::now();
-            format!("{}_{}", now.format("%Y-%m-%dT%H-%M-%S"), session.session_id)
+            let now = jiff::Timestamp::now();
+            format!(
+                "{}_{}",
+                now.strftime("%Y-%m-%dT%H-%M-%S"),
+                session.session_id
+            )
         };
 
         let home = Self::home_dir();
@@ -416,9 +420,9 @@ impl Provider for PiAgent {
             "type": "session",
             "id": session_id,
             "timestamp": session.started_at
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string()),
             "cwd": workspace,
             "provider": session.metadata.get("provider")
                 .and_then(|v| v.as_str())
@@ -542,9 +546,9 @@ impl Provider for PiAgent {
 
             let ts_str = msg
                 .timestamp
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string());
 
             let entry = serde_json::json!({
                 "type": "message",
@@ -868,9 +872,9 @@ mod tests {
             "type": "session",
             "id": sid,
             "timestamp": session.started_at
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string()),
             "cwd": workspace,
         });
         lines.push(serde_json::to_string(&header).unwrap());
@@ -885,9 +889,9 @@ mod tests {
             };
             let ts_str = msg
                 .timestamp
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map(|dt| dt.to_string())
+                .unwrap_or_else(|| jiff::Timestamp::now().to_string());
 
             let mut blocks = vec![json!({"type": "text", "text": msg.content})];
             for tc in &msg.tool_calls {
@@ -1067,7 +1071,7 @@ mod tests {
         lines.push(
             serde_json::to_string(&json!({
                 "type": "session", "id": "2025-01-01T00-00-00_test",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "timestamp": jiff::Timestamp::now().to_string(),
                 "cwd": "/tmp",
             }))
             .unwrap(),
@@ -1094,7 +1098,7 @@ mod tests {
             lines.push(
                 serde_json::to_string(&json!({
                     "type": "message",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "timestamp": jiff::Timestamp::now().to_string(),
                     "message": inner,
                 }))
                 .unwrap(),

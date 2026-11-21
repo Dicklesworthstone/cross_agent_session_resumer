@@ -521,7 +521,7 @@ impl Provider for Cursor {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let target_composer_id = uuid::Uuid::new_v4().to_string();
-        let now_millis = chrono::Utc::now().timestamp_millis();
+        let now_millis = jiff::Timestamp::now().as_millisecond();
 
         // Determine target DB path.
         let global_db = Self::config_dir()
@@ -1371,7 +1371,7 @@ mod tests {
 
         // Write using internal method.
         let composer_id = "roundtrip-test-id";
-        let now_millis = chrono::Utc::now().timestamp_millis();
+        let now_millis = jiff::Timestamp::now().as_millisecond();
 
         let mut headers: Vec<serde_json::Value> = Vec::new();
         for msg in &session.messages {
